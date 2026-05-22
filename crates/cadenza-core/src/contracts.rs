@@ -29,13 +29,41 @@ fn line_assigns_key(line: &str, key: &str) -> bool {
     matches!(rest.bytes().next(), Some(b' ' | b'\t' | b'=')) && rest.trim_start().starts_with('=')
 }
 
+/// Return the value side of `line` with any inline `#` comment stripped. Tracks
+/// whether the scanner is inside a double-quoted string (with backslash
+/// escapes) so an unescaped `#` outside quotes terminates the value; a `#`
+/// inside `"..."` stays part of the value.
+fn strip_inline_comment(line: &str) -> &str {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, ch) in line.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '#' => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
 /// Return every line in `body` that assigns an MVP-critical key but still
-/// carries a `TODO` placeholder in its value.
+/// carries a `TODO` placeholder in its value. `TODO` markers appearing only
+/// inside an inline `#` comment do not count.
 pub fn pending_mvp_critical_keys(body: &str) -> Vec<String> {
     let mut offenders = Vec::new();
     for raw in body.lines() {
         let line = raw.trim_start();
-        if !line.contains(TODO_MARKER) {
+        if !strip_inline_comment(line).contains(TODO_MARKER) {
             continue;
         }
         for key in MVP_CRITICAL_KEYS {
@@ -135,6 +163,32 @@ wasmtime_version = "45.0.0""#,
             "{:?}",
             pending_mvp_critical_keys(&body),
         );
+    }
+
+    #[test]
+    fn inline_comment_todo_after_pinned_value_is_not_an_offender() {
+        let body = ALL_PINNED.replace(
+            r#"toolchain_version = "1.95.0""#,
+            r#"toolchain_version = "1.95.0" # TODO revisit after 1.96 lands"#,
+        );
+        assert!(
+            pending_mvp_critical_keys(&body).is_empty(),
+            "{:?}",
+            pending_mvp_critical_keys(&body),
+        );
+    }
+
+    #[test]
+    fn todo_inside_quoted_value_is_still_an_offender() {
+        // The `#` here lives inside the string literal, so it is part of the
+        // value and the TODO is real, not a comment.
+        let body = ALL_PINNED.replace(
+            r#"toolchain_version = "1.95.0""#,
+            r#"toolchain_version = "TODO-#42 pin once upstream cuts""#,
+        );
+        let offenders = pending_mvp_critical_keys(&body);
+        assert_eq!(offenders.len(), 1, "got: {offenders:?}");
+        assert!(offenders[0].starts_with("toolchain_version"));
     }
 
     #[test]
