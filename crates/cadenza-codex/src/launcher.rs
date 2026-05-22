@@ -132,8 +132,12 @@ impl AppServerLauncher {
             return Err(LaunchError::WorkspaceMissing(self.workspace));
         }
 
+        // Use `bash -c`, not `bash -lc`. A login shell would source the
+        // user's profile scripts, which can write to stdout and corrupt
+        // the JSON-RPC handshake (the launcher's read loop would parse
+        // a profile line as the initialize response).
         let mut cmd = Command::new("bash");
-        cmd.arg("-lc")
+        cmd.arg("-c")
             .arg(&self.command)
             .current_dir(&self.workspace)
             .stdin(Stdio::piped())
@@ -311,6 +315,24 @@ impl AppServerClient {
         }
         let _ = self.child.wait().await;
         Ok(())
+    }
+}
+
+impl Drop for AppServerClient {
+    fn drop(&mut self) {
+        // kill_on_drop(true) on the Command only signals the direct
+        // child (the bash wrapper). Codex is the grandchild of that
+        // shell; if a caller drops AppServerClient without awaiting
+        // shutdown(), only this killpg here guarantees the grandchild
+        // dies. Best-effort: ignore errors because Drop can't propagate.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            // SAFETY: pid is valid for the borrow; killpg with SIGKILL
+            // has no preconditions beyond a valid pgid.
+            unsafe {
+                libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
     }
 }
 
