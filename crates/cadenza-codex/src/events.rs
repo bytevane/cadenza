@@ -203,6 +203,9 @@ struct TurnView {
     #[serde(rename = "completedAt")]
     #[allow(dead_code)]
     completed_at: serde_json::Value,
+    #[serde(rename = "durationMs")]
+    #[allow(dead_code)]
+    duration_ms: serde_json::Value,
 }
 
 /// Structural canary for `account/rateLimits/updated`. The schema is
@@ -288,15 +291,15 @@ mod tests {
     /// required by `TurnView`; `tokenUsage` carries the nested
     /// `total`/`last` breakdowns.
     const SUCCESSFUL_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_42"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"Hello "}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"world"}}
 {"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thr_42","turnId":"turn_1","tokenUsage":{"total":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"last":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"modelContextWindow":128000}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"completed","items":[],"itemsView":{},"error":null,"startedAt":1,"completedAt":2}}}"#;
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"completed","items":[],"itemsView":{},"error":null,"startedAt":1,"completedAt":2,"durationMs":null}}}"#;
 
     /// Replay fixture: a turn that fails with retry recommended.
     const FAILED_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_43"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}
 {"jsonrpc":"2.0","method":"error","params":{"threadId":"thr_43","turnId":"turn_2","error":{"message":"upstream timeout"},"willRetry":true}}"#;
 
     /// Replay fixture: a successful turn that also includes a rate-limit
@@ -304,8 +307,8 @@ mod tests {
     const SUCCESSFUL_TURN_WITH_RATE_LIMITS_AND_UNKNOWN: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_44"}}}
 {"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"rpm","limitName":"per_minute","primary":null,"secondary":null,"credits":null,"planType":null,"rateLimitReachedType":null}}}
 {"jsonrpc":"2.0","method":"future/unknown/event","params":{"opaque":true}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"completed","items":[],"itemsView":{},"error":null,"startedAt":1,"completedAt":2}}}"#;
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"completed","items":[],"itemsView":{},"error":null,"startedAt":1,"completedAt":2,"durationMs":null}}}"#;
 
     fn parse_stream(s: &str) -> Vec<TurnEvent> {
         s.lines()
@@ -424,7 +427,7 @@ mod tests {
     fn turn_started_missing_nullable_required_key_is_typed_error() {
         // Schema requires `error` to be present (can be null). A turn
         // payload missing the key entirely is truncated.
-        let line = r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t","turn":{"id":"u","status":"running","items":[],"itemsView":{},"startedAt":null,"completedAt":null}}}"#;
+        let line = r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t","turn":{"id":"u","status":"running","items":[],"itemsView":{},"startedAt":null,"completedAt":null,"durationMs":null}}}"#;
         let err = parse_notification_line(line).unwrap_err();
         assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
     }
