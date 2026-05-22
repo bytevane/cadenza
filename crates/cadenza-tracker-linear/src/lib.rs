@@ -15,7 +15,10 @@ pub enum TrackerError {
 pub trait IssueTrackerClient {
     fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError>;
     fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError>;
-    fn fetch_issue_states_by_ids(&self, ids: &[String]) -> Result<Vec<(String, String)>, TrackerError>;
+    fn fetch_issue_states_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<(String, String)>, TrackerError>;
 }
 
 #[derive(Debug, Clone)]

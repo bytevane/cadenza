@@ -21,9 +21,7 @@ enum Command {
         workflow: PathBuf,
     },
     /// Print the sanitized workspace key for an issue identifier.
-    WorkspaceKey {
-        identifier: String,
-    },
+    WorkspaceKey { identifier: String },
     /// Print the full workspace path for an issue identifier.
     WorkspacePath {
         #[arg(long)]

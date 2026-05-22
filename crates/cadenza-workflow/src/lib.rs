@@ -36,7 +36,10 @@ pub fn parse_workflow(input: &str) -> Result<WorkflowDefinition, WorkflowError> 
     })
 }
 
-pub fn render_prompt_strict(template: &str, context: serde_json::Value) -> Result<String, minijinja::Error> {
+pub fn render_prompt_strict(
+    template: &str,
+    context: serde_json::Value,
+) -> Result<String, minijinja::Error> {
     let mut env = minijinja::Environment::new();
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
     env.add_template("prompt", template)?;
@@ -50,13 +53,15 @@ mod tests {
 
     #[test]
     fn parses_workflow_frontmatter_and_body() {
-        let workflow = parse_workflow("---\ntracker:\n  kind: linear\n---\nHello {{ issue.identifier }}").unwrap();
+        let workflow =
+            parse_workflow("---\ntracker:\n  kind: linear\n---\nHello {{ issue.identifier }}")
+                .unwrap();
         assert_eq!(workflow.prompt_template, "Hello {{ issue.identifier }}");
     }
 
     #[test]
     fn strict_prompt_fails_on_unknown_variable() {
         let err = render_prompt_strict("{{ missing }}", json!({})).unwrap_err();
-        assert!(err.to_string().contains("missing"));
+        assert_eq!(err.kind(), minijinja::ErrorKind::UndefinedError);
     }
 }

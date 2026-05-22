@@ -54,7 +54,10 @@ impl RuntimeState {
         self.running.insert(
             issue_id,
             RunningEntry {
-                attempt: RunAttempt { status: RunStatus::Running, ..attempt },
+                attempt: RunAttempt {
+                    status: RunStatus::Running,
+                    ..attempt
+                },
                 session_id: None,
                 last_event: None,
             },

@@ -1,5 +1,5 @@
-use camino::{Utf8Path, Utf8PathBuf};
 use cadenza_core::workspace_key;
+use camino::{Utf8Path, Utf8PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -9,7 +9,10 @@ pub enum WorkspaceError {
     RootNotAbsolute(String),
 }
 
-pub fn workspace_path(root: impl AsRef<Utf8Path>, issue_identifier: &str) -> Result<Utf8PathBuf, WorkspaceError> {
+pub fn workspace_path(
+    root: impl AsRef<Utf8Path>,
+    issue_identifier: &str,
+) -> Result<Utf8PathBuf, WorkspaceError> {
     let root = root.as_ref();
     if !root.is_absolute() {
         return Err(WorkspaceError::RootNotAbsolute(root.to_string()));

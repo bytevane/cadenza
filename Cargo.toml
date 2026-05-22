@@ -38,9 +38,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-wasmtime = { version = "46", features = ["async", "component-model"] }
-wasmtime-wasi = "46"
-wasmtime-wasi-http = "46"
+wasmtime = { version = "45", features = ["async", "component-model"] }
+wasmtime-wasi = "45"
+wasmtime-wasi-http = "45"
 
 [profile.release]
 codegen-units = 1

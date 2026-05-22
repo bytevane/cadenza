@@ -21,7 +21,11 @@ impl Default for CodexAppServerConfig {
     fn default() -> Self {
         Self {
             command: "codex".to_string(),
-            args: vec!["app-server".to_string(), "--listen".to_string(), "stdio://".to_string()],
+            args: vec![
+                "app-server".to_string(),
+                "--listen".to_string(),
+                "stdio://".to_string(),
+            ],
             transport: CodexTransport::Stdio,
             schema_sha256: None,
         }
@@ -41,7 +45,12 @@ pub fn validate_mvp_config(config: &CodexAppServerConfig) -> Result<(), CodexErr
         CodexTransport::Stdio => {}
         ref other => return Err(CodexError::UnsupportedTransport(other.clone())),
     }
-    if config.schema_sha256.as_deref().unwrap_or_default().is_empty() {
+    if config
+        .schema_sha256
+        .as_deref()
+        .unwrap_or_default()
+        .is_empty()
+    {
         return Err(CodexError::MissingSchemaHash);
     }
     Ok(())
