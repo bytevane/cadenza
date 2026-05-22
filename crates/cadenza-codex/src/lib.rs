@@ -1,3 +1,18 @@
+//! Codex app-server client boundary.
+//!
+//! Protocol assumptions (JSON-RPC schemas, transport choices) live in this
+//! crate. `launcher` owns the subprocess + initialize handshake; `protocol`
+//! mirrors the relevant schema-generated types under
+//! `schemas/codex/current/`.
+
+pub mod launcher;
+pub mod protocol;
+
+pub use launcher::{AppServerClient, AppServerLauncher, DEFAULT_STDERR_CAP_BYTES, LaunchError};
+pub use protocol::{
+    ClientInfo, InitializeCapabilities, InitializeParams, InitializeResponse, JsonRpcError,
+};
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
