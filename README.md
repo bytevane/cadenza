@@ -67,6 +67,26 @@ The smoke is also wired into the `rust` CI job, so every PR exercises
 the loop. Wasm host capability calls are intentionally skipped while
 issues #16 / #17 are blocked.
 
+To replay the full MVP demo (gate + smoke + CLI helpers) in one
+command, run:
+
+```bash
+./scripts/mvp-demo.sh
+```
+
+For an opt-in profile that talks to a real `codex app-server` and the
+live Linear GraphQL endpoint, see
+[`docs/operations/real-smoke.md`](docs/operations/real-smoke.md) and
+run `./scripts/real-smoke.sh`.
+
+## Operations
+
+- [`docs/operations/compatibility-matrix.md`](docs/operations/compatibility-matrix.md) — pinned upstream versions (Symphony, Codex, WIT, Wasmtime, etc.).
+- [`docs/operations/secret-redaction.md`](docs/operations/secret-redaction.md) — what the scrubber does and does not guarantee.
+- [`docs/operations/real-smoke.md`](docs/operations/real-smoke.md) — opt-in real integration smoke profile.
+- [`docs/operations/rollback-drill.md`](docs/operations/rollback-drill.md) — how to back out of a release without losing workspaces or logs.
+- [`docs/operations/release-notes-template.md`](docs/operations/release-notes-template.md) — template for tagged releases.
+
 Build the first Wasm example component:
 
 ```bash
