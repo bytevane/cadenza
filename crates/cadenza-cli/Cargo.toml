@@ -28,4 +28,5 @@ cadenza-obs = { path = "../cadenza-obs" }
 cadenza-orchestrator = { path = "../cadenza-orchestrator" }
 cadenza-tracker-linear = { path = "../cadenza-tracker-linear" }
 serde_json.workspace = true
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

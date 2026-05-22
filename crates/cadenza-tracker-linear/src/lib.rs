@@ -8,6 +8,7 @@
 //! `host-linear` Wasm capability per `ARCHITECTURE.md`.
 
 pub mod queries;
+pub mod transport;
 
 use std::sync::Arc;
 
