@@ -29,28 +29,40 @@ fn line_assigns_key(line: &str, key: &str) -> bool {
     matches!(rest.bytes().next(), Some(b' ' | b'\t' | b'=')) && rest.trim_start().starts_with('=')
 }
 
-/// Return the value side of `line` with any inline `#` comment stripped. Tracks
-/// whether the scanner is inside a double-quoted string (with backslash
-/// escapes) so an unescaped `#` outside quotes terminates the value; a `#`
-/// inside `"..."` stays part of the value.
+/// Return the value side of `line` with any inline `#` comment stripped.
+/// Tracks TOML basic strings (`"..."`, with backslash escapes) and literal
+/// strings (`'...'`, no escapes) so a `#` inside any string form stays part of
+/// the value; only an unquoted `#` terminates it.
 fn strip_inline_comment(line: &str) -> &str {
-    let mut in_string = false;
+    enum State {
+        Plain,
+        Basic,
+        Literal,
+    }
+    let mut state = State::Plain;
     let mut escaped = false;
     for (i, ch) in line.char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
+        match state {
+            State::Basic => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    state = State::Plain;
+                }
             }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '#' => return &line[..i],
-            _ => {}
+            State::Literal => {
+                if ch == '\'' {
+                    state = State::Plain;
+                }
+            }
+            State::Plain => match ch {
+                '"' => state = State::Basic,
+                '\'' => state = State::Literal,
+                '#' => return &line[..i],
+                _ => {}
+            },
         }
     }
     line
@@ -189,6 +201,32 @@ wasmtime_version = "45.0.0""#,
         let offenders = pending_mvp_critical_keys(&body);
         assert_eq!(offenders.len(), 1, "got: {offenders:?}");
         assert!(offenders[0].starts_with("toolchain_version"));
+    }
+
+    #[test]
+    fn todo_inside_literal_single_quoted_value_is_still_an_offender() {
+        // TOML literal strings use single quotes. `#` inside `'...'` is still
+        // part of the value, not the start of a comment.
+        let body = ALL_PINNED.replace(
+            r#"toolchain_version = "1.95.0""#,
+            "toolchain_version = 'TODO-#123 pin once upstream cuts'",
+        );
+        let offenders = pending_mvp_critical_keys(&body);
+        assert_eq!(offenders.len(), 1, "got: {offenders:?}");
+        assert!(offenders[0].starts_with("toolchain_version"));
+    }
+
+    #[test]
+    fn literal_string_value_followed_by_todo_comment_is_not_an_offender() {
+        let body = ALL_PINNED.replace(
+            r#"toolchain_version = "1.95.0""#,
+            "toolchain_version = '1.95.0' # TODO revisit when 1.96 lands",
+        );
+        assert!(
+            pending_mvp_critical_keys(&body).is_empty(),
+            "{:?}",
+            pending_mvp_critical_keys(&body),
+        );
     }
 
     #[test]
