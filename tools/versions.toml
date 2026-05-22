@@ -16,8 +16,8 @@ transport = "stdio://"
 schema_sha256 = "TODO-generate-with-scripts/codex-schema.sh"
 
 [wasm]
-wasmtime_family = "46"
-wit_package = "cadenza:runtime@0.1.0"
+wasmtime_family = "45"
+wit_package = "cadenza:runtime@0.2.0"
 wasm_tools_version = "TODO-pin-exact-wasm-tools-version"
 wit_bindgen_version = "TODO-pin-exact-wit-bindgen-version-if-used"
 

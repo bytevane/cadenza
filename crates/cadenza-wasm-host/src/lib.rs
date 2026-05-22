@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const WIT_PACKAGE: &str = "cadenza:runtime@0.1.0";
+pub const WIT_PACKAGE: &str = "cadenza:runtime@0.2.0";
 pub const WIT_WORLD: &str = "tool-runtime";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
