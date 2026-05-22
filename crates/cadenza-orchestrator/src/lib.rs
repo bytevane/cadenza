@@ -8,7 +8,15 @@
 //!
 //! All mutating methods take `&mut self`; the orchestrator runs as a
 //! single-task owner so concurrent state writers are impossible by
-//! construction. Real Codex/Wasm execution wiring lands in later PRs.
+//! construction. Lifecycle rules (retry / continuation / stall /
+//! reconcile) live in [`lifecycle`]. Real Codex/Wasm execution wiring
+//! lands in later PRs.
+
+pub mod lifecycle;
+pub use lifecycle::{
+    DEFAULT_MAX_RETRIES, LifecycleDecision, LifecyclePolicy, ReconcilePlan, backoff_delay_ms,
+    reconcile_from_tracker,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 
