@@ -1,27 +1,42 @@
 # Cadenza version ledger.
-# Fill exact versions during bootstrap and commit changes in a dedicated "version freeze" PR.
+#
+# Single ledger of upstream facts Cadenza targets. Changes to any of the
+# MVP-critical keys (see crates/cadenza-core/src/contracts.rs) MUST land in a
+# dedicated PR paired with an ADR update — see CONTRACTS.md.
 
 [upstream]
-symphony_spec_sha = "TODO-pin-openai-symphony-SPEC.md-commit"
+# openai/symphony SPEC.md baseline commit. Pinned 2026-05-22 from
+# `gh api repos/openai/symphony/commits/main`.
+symphony_spec_sha = "2c1851830477434100fdb8980fcc1fce1a8af81d"
 
 [rust]
 channel = "stable"
+# Exact toolchain used by CI and by rust-toolchain.toml.
+toolchain_version = "1.95.0"
+# MSRV: a published consumer is allowed to compile down to this version even
+# when the developer toolchain is newer.
 minimum_workspace_rust_version = "1.85"
 wasm_target = "wasm32-wasip2"
 
 [codex]
-# Do not use "latest" in production images. Pin an exact CLI/app-server version here.
-cli_version = "TODO-pin-exact-codex-version"
+# Do not use "latest" in production images. Pin an exact CLI/app-server version.
+cli_version = "rust-v0.133.0"
 transport = "stdio://"
-schema_sha256 = "TODO-generate-with-scripts/codex-schema.sh"
+# Generated artifact: Issue #4 populates ci/expected/codex-schema.sha256 via
+# scripts/codex-schema.sh and turns on the codex-schema-gate CI job.
+schema_sha256_file = "ci/expected/codex-schema.sha256"
 
 [wasm]
 wasmtime_family = "45"
+# Exact Wasmtime crate version. Must stay inside the family pin.
+wasmtime_version = "45.0.0"
 wit_package = "cadenza:runtime@0.2.0"
-wasm_tools_version = "TODO-pin-exact-wasm-tools-version"
-wit_bindgen_version = "TODO-pin-exact-wit-bindgen-version-if-used"
+wit_version = "0.2.0"
+wasm_tools_version = "1.250.0"
+wit_bindgen_version = "0.57.1"
 
 [claude_code]
-# Claude Code is a development-time generator/reviewer, not a production runtime dependency.
-cli_or_sdk_version = "TODO-pin-if-used-in-CI"
+# Claude Code is a development-time generator/reviewer, not a production
+# runtime dependency. Intentionally unpinned; not part of the MVP-critical set.
+cli_or_sdk_version = "unpinned-dev-only"
 allowed_modes = ["claude -p", "Agent SDK"]

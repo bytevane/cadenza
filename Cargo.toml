@@ -18,7 +18,7 @@ edition = "2024"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.85"
 authors = ["Cadenza contributors"]
-repository = "https://example.invalid/cadenza"
+repository = "https://github.com/bytevane/cadenza"
 
 [workspace.dependencies]
 anyhow = "1"

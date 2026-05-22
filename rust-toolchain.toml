@@ -1,4 +1,6 @@
+# Pinned by tools/versions.toml `rust.toolchain_version`. Changes require a
+# dedicated PR + ADR update — see CONTRACTS.md.
 [toolchain]
-channel = "stable"
+channel = "1.95.0"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-wasip2"]
