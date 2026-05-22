@@ -5,6 +5,11 @@
 //! invariant lexically (no FS access required) and, when the workspace
 //! exists on disk, by canonicalising both paths so a symlink cannot
 //! tunnel out of the root.
+//!
+//! Hook execution lives in [`hooks`]; see that module for the trusted
+//! shell hook boundary.
+
+pub mod hooks;
 
 use std::path::{Path, PathBuf};
 

@@ -114,6 +114,60 @@ impl OrchestratorConfig {
 pub struct HooksConfig {
     #[serde(default)]
     pub after_create: Option<HookCommand>,
+    #[serde(default)]
+    pub before_run: Option<HookCommand>,
+    #[serde(default)]
+    pub after_run: Option<HookCommand>,
+    #[serde(default)]
+    pub before_remove: Option<HookCommand>,
+}
+
+/// The four hook phases that a workflow can opt into. The order in
+/// `Self::ALL` is the order operators read them as a lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookPhase {
+    AfterCreate,
+    BeforeRun,
+    AfterRun,
+    BeforeRemove,
+}
+
+impl HookPhase {
+    pub const ALL: [HookPhase; 4] = [
+        HookPhase::AfterCreate,
+        HookPhase::BeforeRun,
+        HookPhase::AfterRun,
+        HookPhase::BeforeRemove,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookPhase::AfterCreate => "after_create",
+            HookPhase::BeforeRun => "before_run",
+            HookPhase::AfterRun => "after_run",
+            HookPhase::BeforeRemove => "before_remove",
+        }
+    }
+
+    /// Fatal phases must abort dispatch on hook failure; warn phases log
+    /// the failure and continue. The orchestrator enforces this in #18;
+    /// the workflow crate only documents it so the policy lives next to
+    /// the phase enum.
+    pub fn is_fatal_by_default(self) -> bool {
+        matches!(self, HookPhase::AfterCreate | HookPhase::BeforeRun)
+    }
+}
+
+impl HooksConfig {
+    pub fn get(&self, phase: HookPhase) -> Option<&HookCommand> {
+        match phase {
+            HookPhase::AfterCreate => self.after_create.as_ref(),
+            HookPhase::BeforeRun => self.before_run.as_ref(),
+            HookPhase::AfterRun => self.after_run.as_ref(),
+            HookPhase::BeforeRemove => self.before_remove.as_ref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,14 +284,19 @@ fn validate(c: &WorkflowConfig) -> Result<(), WorkflowError> {
             ));
         }
     }
-    if let Some(hook) = &c.hooks.after_create {
-        if hook.command.trim().is_empty() {
-            return Err(WorkflowError::invalid(
-                "hooks.after_create.command",
-                "must not be empty",
-            ));
+    for phase in HookPhase::ALL {
+        if let Some(hook) = c.hooks.get(phase) {
+            if hook.command.trim().is_empty() {
+                return Err(WorkflowError::invalid(
+                    format!("hooks.{}.command", phase.as_str()),
+                    "must not be empty",
+                ));
+            }
+            require_positive_u64(
+                &format!("hooks.{}.timeout_ms", phase.as_str()),
+                hook.timeout_ms,
+            )?;
         }
-        require_positive_u64("hooks.after_create.timeout_ms", hook.timeout_ms)?;
     }
     if !c.prompt.strict_undefined {
         // The renderer in this crate hard-codes `UndefinedBehavior::Strict`.
@@ -586,6 +645,49 @@ prompt body
         };
         assert_eq!(field, "orchestrator");
         assert!(message.contains("todo"));
+    }
+
+    #[test]
+    fn each_hook_phase_round_trips_through_config() {
+        let body = MINIMAL_FRONT_MATTER
+            .trim_end_matches("---\nprompt body\n")
+            .to_string()
+            + "hooks:\n  after_create:\n    command: \"echo create\"\n  before_run:\n    command: \"echo before-run\"\n  after_run:\n    command: \"echo after-run\"\n  before_remove:\n    command: \"echo before-remove\"\n---\nprompt body\n";
+        let w = parse_workflow(&body).expect("parse");
+        let names: Vec<_> = HookPhase::ALL
+            .iter()
+            .map(|p| w.config.hooks.get(*p).map(|h| h.command.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("echo create"),
+                Some("echo before-run"),
+                Some("echo after-run"),
+                Some("echo before-remove"),
+            ],
+        );
+    }
+
+    #[test]
+    fn before_run_hook_with_zero_timeout_is_invalid_boundary() {
+        let body = MINIMAL_FRONT_MATTER
+            .trim_end_matches("---\nprompt body\n")
+            .to_string()
+            + "hooks:\n  before_run:\n    command: \"git clean -xdf\"\n    timeout_ms: 0\n---\nprompt body\n";
+        let err = parse_workflow(&body).unwrap_err();
+        let WorkflowError::Invalid { field, .. } = err else {
+            panic!("unexpected: {err:?}");
+        };
+        assert_eq!(field, "hooks.before_run.timeout_ms");
+    }
+
+    #[test]
+    fn fatal_phases_match_documentation() {
+        assert!(HookPhase::AfterCreate.is_fatal_by_default());
+        assert!(HookPhase::BeforeRun.is_fatal_by_default());
+        assert!(!HookPhase::AfterRun.is_fatal_by_default());
+        assert!(!HookPhase::BeforeRemove.is_fatal_by_default());
     }
 
     #[test]
