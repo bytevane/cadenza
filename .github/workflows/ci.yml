@@ -26,6 +26,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+      - name: MVP smoke (mock loop)
+        run: ./scripts/mvp-smoke.sh
       - name: Build example Wasm plugin
         run: cargo build -p cadenza-linear-graphql-plugin --target wasm32-wasip2 --release
       - name: Install wasm-tools

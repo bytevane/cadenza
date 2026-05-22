@@ -52,6 +52,21 @@ cargo run -p cadenza-cli -- doctor --workflow WORKFLOW.example.md
 cargo run -p cadenza-cli -- workspace-key ABC-123/foo
 ```
 
+## End-to-end MVP smoke
+
+A single mock-driven integration test wires the full Cadenza loop —
+tracker candidate → workflow parse → orchestrator dispatch → mock
+Codex event stream → lifecycle decision → observability snapshot — and
+runs in `cargo test`. To run just the smoke:
+
+```bash
+./scripts/mvp-smoke.sh
+```
+
+The smoke is also wired into the `rust` CI job, so every PR exercises
+the loop. Wasm host capability calls are intentionally skipped while
+issues #16 / #17 are blocked.
+
 Build the first Wasm example component:
 
 ```bash
