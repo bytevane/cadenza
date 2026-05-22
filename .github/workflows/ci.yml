@@ -60,4 +60,15 @@ jobs:
           sudo install -m 0755 "$bin" /usr/local/bin/codex
           codex --version
       - name: Generate Codex schema and compare hash
+        id: schema-check
+        continue-on-error: true
         run: ./scripts/codex-schema.sh --check
+      - name: Upload regenerated schemas (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-schemas-linux
+          path: schemas/codex/current/
+      - name: Fail if schema gate did not pass
+        if: steps.schema-check.outcome != 'success'
+        run: exit 1
