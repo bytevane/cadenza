@@ -146,21 +146,23 @@ impl WorkflowSource {
     /// `current()` is preserved (last-known-good) and a `Rejected`
     /// event is recorded so the operator can see what happened.
     ///
-    /// All state mutation (version bump, Arc swap, last_event, history)
-    /// happens inside a single write-lock critical section so concurrent
-    /// callers cannot publish stale metadata (e.g. last_event reverting
-    /// to an older version after a newer reload already completed).
+    /// **File I/O happens inside the write lock.** Reading outside the
+    /// lock would let two concurrent callers race: A reads stale bytes,
+    /// B reads fresh bytes and commits first, then A overwrites `current`
+    /// with stale data while still bumping the version. Holding the lock
+    /// across `fs::read_to_string` + parse is the simplest path to a
+    /// linearizable last-known-good guarantee. The reload itself reads a
+    /// small Markdown file, so the lock contention is acceptable.
     pub fn try_reload(&self) -> ReloadOutcome {
-        let parsed = fs::read_to_string(&self.path)
-            .map_err(|e| WorkflowSourceError::Io {
-                path: self.path.clone(),
-                source: e,
-            })
-            .and_then(|s| parse_workflow(&s).map_err(WorkflowSourceError::from));
-
         let outcome = {
             let mut state = self.state.write().expect("source state lock poisoned");
-            let outcome = match parsed {
+            let outcome = match fs::read_to_string(&self.path)
+                .map_err(|e| WorkflowSourceError::Io {
+                    path: self.path.clone(),
+                    source: e,
+                })
+                .and_then(|s| parse_workflow(&s).map_err(WorkflowSourceError::from))
+            {
                 Ok(definition) => {
                     state.version = state.version.saturating_add(1);
                     state.current = Arc::new(definition);
@@ -446,6 +448,39 @@ prompt body
                 "expected oldest event version > 1 after overflow, got {version}",
             ),
             other => panic!("expected Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_reloads_never_publish_stale_snapshot() {
+        // Race regression: two threads call try_reload after the file is
+        // updated to a known-fresh value. Whichever thread wins the lock
+        // last must observe the same fresh content — the version and the
+        // active config must never disagree, and no stale-content event
+        // can be recorded after a fresher reload completed.
+        let f = make_tempfile(VALID_BODY);
+        let src = Arc::new(WorkflowSource::load_initial(f.path()).unwrap());
+        let bumped = VALID_BODY.replace(r#"token: "secret""#, r#"token: "fresh""#);
+        rewrite(&f, &bumped);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let src = Arc::clone(&src);
+                std::thread::spawn(move || src.try_reload())
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("reload thread");
+        }
+
+        // After all threads complete: version moved by exactly 8 (one bump
+        // per call), the active config reflects the fresh bytes, and the
+        // most recent recorded event matches the active version.
+        assert_eq!(src.version(), 1 + 8);
+        assert_eq!(src.current().config.tracker.token, "fresh");
+        match src.last_event().outcome {
+            ReloadOutcome::Loaded { version } => assert_eq!(version, src.version()),
+            other => panic!("expected last event Loaded, got {other:?}"),
         }
     }
 
