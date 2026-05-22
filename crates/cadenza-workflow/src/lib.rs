@@ -771,20 +771,6 @@ prompt body
         );
     }
 
-    #[test]
-    fn render_error_is_disjoint_from_workflow_error() {
-        // Compile-time check via trait bounds: PromptRenderError does not
-        // From-convert into WorkflowError, and vice-versa.
-        fn assert_no_conversion<A, B>()
-        where
-            A: 'static,
-            B: 'static,
-        {
-            // No body — just enforces that the two types are distinct.
-        }
-        assert_no_conversion::<PromptRenderError, WorkflowError>();
-    }
-
     // Boundary: attempt is a plain u32 — both 0 and u32::MAX must render
     // without error so we never reject a valid run attempt number.
     #[test]

@@ -72,10 +72,13 @@ as missing.
 
 ## Disjoint error types
 
-`render_error_is_disjoint_from_workflow_error` asserts (via type-level
-identity, not a `From` lookup) that `PromptRenderError` and
-`WorkflowError` do not implicitly cross — keeps the orchestrator from
-catching one and shipping it as the other.
+`PromptRenderError` and `WorkflowError` deliberately do not implement
+`From` for each other. The separation is enforced by the source — no
+`#[from]` annotation, no `impl From<…>` block, no transitive
+`anyhow::Error` flattening at the boundary. A compile-time assertion was
+considered but added complexity (custom trait helpers or a
+`static_assertions` dep) without changing reviewer behaviour, so it was
+dropped per project YAGNI rule.
 
 ## Out of scope
 
