@@ -1,32 +1,103 @@
 # AI-assisted contribution policy
 
-Cadenza allows Claude Code and Codex to generate implementation patches, but the project is contract-first.
+Cadenza allows Claude Code and Codex to generate implementation patches,
+but the project is contract-first. Every AI-authored PR must satisfy the
+checks below before a human reviewer marks it ready to merge.
 
 ## Required context for every AI coding task
 
 Every generated patch must reference:
 
 - `ARCHITECTURE.md`
+- `CONTRACTS.md`
 - `docs/VERSIONING.md`
 - `docs/WIT_ABI.md`
+- `docs/operations/wit-abi-versioning.md`
 - `SECURITY.md`
 - the relevant crate README or module docs
 
+The PR description must list which of these the patch was conditioned
+on; reviewers verify that the patch never silently invents API surface
+absent from those documents.
+
 ## Tool split
 
-- Codex: protocol-adjacent code, app-server client code, replay fixtures, schema-bound tests.
-- Claude Code: scaffolding, Rust module implementation, docs, CI templates, refactoring, test data.
+- **Codex**: protocol-adjacent code, app-server client code, replay
+  fixtures, schema-bound tests.
+- **Claude Code**: scaffolding, Rust module implementation, docs, CI
+  templates, refactoring, test data.
+
+Cross-component patches that touch both protocol code AND extension/Wasm
+code in the same PR are discouraged. Land each contract surface as its
+own PR with its own ADR (see "Patch scope" below).
+
+## Patch scope
+
+AI tools tend to "fix everything they notice." Keep them on a leash:
+
+- One PR = one issue. The PR template requires `Closes #N`.
+- Prefer a single crate or a single doc surface per PR. Reach across
+  crates only when the issue itself spans crates (e.g. a contract bump
+  whose downstream consumers live in two crates).
+- Do not bundle a refactor with a bug fix; ship the fix first so it can
+  be reverted cleanly if the refactor regresses something.
+- Do not opportunistically rename `_var` locals, re-export types, or
+  delete comments while implementing an unrelated feature.
+
+When you ask an AI tool for a patch, restrict it to the files relevant
+to the issue and surface the constraint in the prompt (e.g. "modify
+only `crates/cadenza-codex/` and `crates/cadenza-codex/tests/`").
+
+## Branch naming
+
+| Branch prefix      | Use when …                                                  |
+| ------------------ | ----------------------------------------------------------- |
+| `issue-<n>-<slug>` | An issue tracks the work; the slug repeats the issue title. |
+| `feat/<slug>`      | Net-new feature without a tracking issue (rare).            |
+| `fix/<slug>`       | Bug fix without a tracking issue.                           |
+| `infra/<slug>`     | CI, tooling, dependency, repo-infrastructure changes.       |
+| `sec/<slug>`       | Security-sensitive changes (secret handling, sandbox, ABI). |
+| `docs/<slug>`      | Documentation-only changes.                                 |
+| `chore/<slug>`     | Mechanical cleanup (formatting, version bumps).             |
+
+Slugs are short kebab-case (`feat/workflow-loader`,
+`infra/codex-schema-gate`, `sec/secret-scrubber`). Do not put bug
+identifiers in the branch name unless the issue tracker uses them.
 
 ## PR checklist for AI patches
 
-- Did the patch change Codex app-server schema assumptions?
-- Did the patch change WIT ABI?
-- Did the patch change secret handling or logs?
-- Did the patch add or update conformance tests?
-- Does the patch keep the orchestrator as the single authoritative state owner?
+Every AI-authored PR ticks the matching boxes in
+`.github/pull_request_template.md`. The author confirms the **Contract
+impact**, **Tests**, and **AI assistance** sections; the reviewer
+confirms the **Reviewer checklist** section.
+
+If the patch touches any of the contract surfaces below, the PR must
+add or amend an ADR under `decisions/`:
+
+- Codex app-server schema bump.
+- WIT ABI changes (source or plugin component world).
+- Secret-handling, redaction, or log-field changes.
+- Workspace path safety rules.
+- Orchestrator state machine semantics.
 
 ## Prompt discipline
 
-Use `prompts/codex-runtime.md` for Codex app-server work.
-Use `prompts/claude-dev.md` for general implementation work.
-Do not ask either tool to invent protocol fields not present in generated schemas.
+- Use `prompts/codex-runtime.md` for Codex app-server work.
+- Use `prompts/claude-dev.md` for general implementation work.
+- Do not ask either tool to invent protocol fields not present in
+  generated schemas.
+- Do not ask either tool to skip tests via `#[ignore]`, `--no-verify`,
+  or `if false` guards in CI.
+- The TDD discipline applies to AI-generated code: a failing test
+  before the implementation, paired-edge boundary cases, no `cap/2`
+  midpoint coverage as a stand-in for boundary tests.
+
+## When the AI tool is wrong
+
+- Push back on tool output that invents API surface, expands scope, or
+  silently changes pinned versions.
+- If the tool keeps drifting, narrow the prompt or split the work into
+  smaller patches. Do not merge a "mostly-right" patch and intend to
+  follow up.
+- Record recurring mistakes in `docs/research/` or in a dedicated ADR
+  so future prompts avoid them.
