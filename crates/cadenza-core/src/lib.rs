@@ -60,11 +60,7 @@ pub fn workspace_key(identifier: &str) -> String {
         })
         .collect();
 
-    if key.is_empty() {
-        "_".to_string()
-    } else {
-        key
-    }
+    if key.is_empty() { "_".to_string() } else { key }
 }
 
 #[cfg(test)]
