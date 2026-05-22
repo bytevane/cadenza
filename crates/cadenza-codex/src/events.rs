@@ -133,7 +133,14 @@ pub fn parse_notification_line(line: &str) -> Result<TurnEvent, EventStreamError
                 delta: parsed.delta,
             }
         }
-        Some("account/rateLimits/updated") => TurnEvent::RateLimitsUpdated { params },
+        Some("account/rateLimits/updated") => {
+            // Validate the envelope so a truncated payload (e.g. `{}`) fails
+            // loud; pass the raw params through afterwards because the
+            // RateLimitSnapshot fields are all nullable and the orchestrator
+            // wants the original shape for forwarding.
+            let _envelope: RateLimitsEnvelope = serde_json::from_value(params.clone())?;
+            TurnEvent::RateLimitsUpdated { params }
+        }
         Some(other) => TurnEvent::Other {
             method: other.to_string(),
             params,
@@ -169,16 +176,35 @@ struct TurnStartedOrCompleted {
     turn: TurnView,
 }
 
-/// Schema-required Turn fields that Cadenza extracts. The full `Turn`
-/// struct in `schemas/codex/current/v2/Turn.ts` has many more fields
-/// (items, itemsView, error, …) which we deliberately ignore — but the
-/// status must be present so we fail closed on a truncated payload,
-/// per the contract documented in `docs/specs/13-codex-turn-lifecycle.md`.
+/// Schema-required Turn fields that Cadenza validates. The full `Turn`
+/// struct in `schemas/codex/current/v2/Turn.ts` has more fields the
+/// orchestrator does not consume (error, startedAt, completedAt — the
+/// latter two are explicitly nullable in the schema). The required-by-
+/// schema, non-nullable fields are `id`, `status`, `items`, `itemsView`
+/// — all four are required here as a structural canary so a truncated
+/// payload fails closed, per
+/// `docs/specs/13-codex-turn-lifecycle.md`.
 #[derive(Debug, Deserialize)]
 struct TurnView {
     id: String,
     #[allow(dead_code)]
     status: serde_json::Value,
+    #[allow(dead_code)]
+    items: serde_json::Value,
+    #[serde(rename = "itemsView")]
+    #[allow(dead_code)]
+    items_view: serde_json::Value,
+}
+
+/// Structural canary for `account/rateLimits/updated`. The schema is
+/// `{ rateLimits: RateLimitSnapshot }`. Every field on the inner
+/// snapshot is nullable, so the only fixed structural assertion is
+/// that the `rateLimits` key exists at all.
+#[derive(Debug, Deserialize)]
+struct RateLimitsEnvelope {
+    #[serde(rename = "rateLimits")]
+    #[allow(dead_code)]
+    rate_limits: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,24 +269,24 @@ mod tests {
     /// required by `TurnView`; `tokenUsage` carries the nested
     /// `total`/`last` breakdowns.
     const SUCCESSFUL_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_42"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"running"}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"running","items":[],"itemsView":{}}}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"Hello "}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"world"}}
 {"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thr_42","turnId":"turn_1","tokenUsage":{"total":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"last":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"modelContextWindow":128000}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"completed"}}}"#;
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"completed","items":[],"itemsView":{}}}}"#;
 
     /// Replay fixture: a turn that fails with retry recommended.
     const FAILED_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_43"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running"}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running","items":[],"itemsView":{}}}}
 {"jsonrpc":"2.0","method":"error","params":{"threadId":"thr_43","turnId":"turn_2","error":{"message":"upstream timeout"},"willRetry":true}}"#;
 
     /// Replay fixture: a successful turn that also includes a rate-limit
     /// observation and one unknown method that must pass through as Other.
     const SUCCESSFUL_TURN_WITH_RATE_LIMITS_AND_UNKNOWN: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_44"}}}
-{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"buckets":[{"name":"per_minute","remaining":100}]}}
+{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"rpm","limitName":"per_minute","primary":null,"secondary":null,"credits":null,"planType":null,"rateLimitReachedType":null}}}
 {"jsonrpc":"2.0","method":"future/unknown/event","params":{"opaque":true}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"running"}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"completed"}}}"#;
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"running","items":[],"itemsView":{}}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"completed","items":[],"itemsView":{}}}}"#;
 
     fn parse_stream(s: &str) -> Vec<TurnEvent> {
         s.lines()
@@ -340,10 +366,31 @@ mod tests {
             .expect("expected RateLimitsUpdated");
         match rl {
             TurnEvent::RateLimitsUpdated { params } => {
-                assert!(params.get("buckets").is_some(), "params: {params}");
+                assert!(
+                    params.get("rateLimits").is_some(),
+                    "params should carry rateLimits envelope: {params}",
+                );
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn rate_limits_with_missing_envelope_is_typed_error() {
+        // Truncated payload — schema requires `rateLimits`.
+        let line = r#"{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{}}"#;
+        let err = parse_notification_line(line).unwrap_err();
+        assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn turn_started_with_status_but_no_items_is_typed_error() {
+        // `items` and `itemsView` are required by the v2 Turn schema in
+        // addition to `id`/`status`. A turn payload that ships only
+        // `{id, status}` is still considered truncated.
+        let line = r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t","turn":{"id":"u","status":"running"}}}"#;
+        let err = parse_notification_line(line).unwrap_err();
+        assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
     }
 
     #[test]
