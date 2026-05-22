@@ -92,7 +92,7 @@ interface host-workspace {
 
 interface host-http {
     use types.{host-error, http-request, http-response};
-    http-request: func(req: http-request) -> result<http-response, host-error>;
+    send: func(req: http-request) -> result<http-response, host-error>;
 }
 
 interface host-secrets {
