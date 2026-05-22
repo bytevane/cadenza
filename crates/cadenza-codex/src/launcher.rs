@@ -174,7 +174,18 @@ impl AppServerLauncher {
             method: "initialize",
             params: init,
         };
-        let payload = serde_json::to_vec(&request).map_err(LaunchError::Encode)?;
+        let payload = match serde_json::to_vec(&request) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Encode fires after spawn — clean up so we never leak the
+                // child or the stderr capture task.
+                kill_now(&mut child).await;
+                let _ = child.wait().await;
+                stderr_task.abort();
+                let _ = stderr_task.await;
+                return Err(LaunchError::Encode(e));
+            }
+        };
         let write_result = async {
             stdin.write_all(&payload).await?;
             stdin.write_all(b"\n").await?;
@@ -316,18 +327,21 @@ async fn kill_now(child: &mut Child) {
 }
 
 /// Wait briefly for the stderr capture task to drain whatever was emitted
-/// right before a child exit. Polls the buffer length up to 200 ms; if two
-/// consecutive samples are equal the buffer has stabilised. This is a
-/// bounded best-effort — the cost is paid only on error paths.
+/// right before a child exit. Polls the monotonic `total_pushed` counter
+/// up to 200 ms; if two consecutive samples agree the writer has stopped.
+/// Using a counter (instead of `buf.len()`) is necessary because once the
+/// ring fills its length is constant while the writer can still be
+/// streaming new bytes that would push older ones out — the diagnostic
+/// tail. Bounded best-effort — the cost is paid only on error paths.
 async fn settle_stderr(buf: &Arc<Mutex<BoundedBuf>>) {
     let deadline = std::time::Instant::now() + Duration::from_millis(200);
-    let mut last_len: Option<usize> = None;
+    let mut last_total: Option<u64> = None;
     loop {
-        let len = buf.lock().await.buf.len();
-        if Some(len) == last_len && len > 0 {
+        let total = buf.lock().await.total_pushed;
+        if Some(total) == last_total && total > 0 {
             return;
         }
-        last_len = Some(len);
+        last_total = Some(total);
         if std::time::Instant::now() >= deadline {
             return;
         }
@@ -365,11 +379,17 @@ fn redact_text(mut text: String, secrets: &[String]) -> String {
 /// failures usually emit the diagnostic line right before exit; keeping
 /// the head would discard exactly that. The implementation drops the
 /// oldest byte for every new byte once the cap is reached.
+///
+/// `total_pushed` is a monotonic counter (saturating). `settle_stderr`
+/// uses it instead of `buf.len()` because once the ring is full the
+/// length is constant — using length would mark "settled" while new
+/// bytes (and the actual diagnostic tail) are still arriving.
 #[derive(Debug)]
 struct BoundedBuf {
     cap: usize,
     buf: std::collections::VecDeque<u8>,
     overflowed: bool,
+    total_pushed: u64,
 }
 
 impl BoundedBuf {
@@ -378,16 +398,25 @@ impl BoundedBuf {
             cap,
             buf: std::collections::VecDeque::with_capacity(cap.min(8 * 1024)),
             overflowed: false,
+            total_pushed: 0,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
+        if self.cap == 0 {
+            if !chunk.is_empty() {
+                self.overflowed = true;
+                self.total_pushed = self.total_pushed.saturating_add(chunk.len() as u64);
+            }
+            return;
+        }
         for &b in chunk {
             if self.buf.len() == self.cap {
                 self.buf.pop_front();
                 self.overflowed = true;
             }
             self.buf.push_back(b);
+            self.total_pushed = self.total_pushed.saturating_add(1);
         }
     }
 
@@ -401,5 +430,54 @@ impl BoundedBuf {
             );
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_buffer_with_zero_cap_does_not_grow_unbounded() {
+        let mut b = BoundedBuf::new(0);
+        b.push(b"hello");
+        b.push(b"world");
+        assert_eq!(b.buf.len(), 0);
+        assert!(b.overflowed);
+        assert_eq!(b.total_pushed, 10);
+        // Snapshot still reflects the overflow marker.
+        let s = b.snapshot_string();
+        assert!(s.contains("truncated"), "{s}");
+    }
+
+    // Boundary: =N (under cap → no overflow) paired with =N+1
+    // (cap+1 byte → overflow, oldest evicted, tail retained).
+    #[test]
+    fn ring_buffer_under_cap_no_overflow() {
+        let mut b = BoundedBuf::new(3);
+        b.push(b"ab");
+        assert!(!b.overflowed);
+        assert_eq!(b.buf.iter().copied().collect::<Vec<_>>(), b"ab");
+        assert_eq!(b.total_pushed, 2);
+    }
+
+    #[test]
+    fn ring_buffer_keeps_tail_when_overfilled() {
+        let mut b = BoundedBuf::new(3);
+        b.push(b"abcdef");
+        assert!(b.overflowed);
+        assert_eq!(b.buf.iter().copied().collect::<Vec<_>>(), b"def");
+        assert_eq!(b.total_pushed, 6);
+    }
+
+    #[test]
+    fn total_pushed_keeps_climbing_after_ring_fills() {
+        // settle_stderr depends on total_pushed continuing to move even
+        // when buf.len() has plateaued at cap.
+        let mut b = BoundedBuf::new(2);
+        b.push(b"abcd");
+        let after_first = b.total_pushed;
+        b.push(b"e");
+        assert!(b.total_pushed > after_first);
     }
 }
