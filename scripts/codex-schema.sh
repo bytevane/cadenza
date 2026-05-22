@@ -2,12 +2,17 @@
 # Regenerate Codex app-server schema artifacts and either record (default)
 # or verify (--check) the aggregate sha256.
 #
-# Determinism note: `codex app-server generate-json-schema` emits the
-# aggregated `codex_app_server_protocol.v2.schemas.json` with HashMap-ordered
-# top-level definitions, so the raw output is not byte-stable between runs.
-# Every JSON file is normalized through `jq --sort-keys` before hashing so
-# the schema gate compares semantic content, not iteration order.
+# Determinism notes:
+#  - `codex app-server generate-json-schema` emits the aggregated
+#    `codex_app_server_protocol.v2.schemas.json` with HashMap-ordered top-level
+#    definitions, so the raw output is not byte-stable between runs. Every
+#    JSON file is normalized through `jq --sort-keys` before hashing.
+#  - `sort` orders bytes differently under `en_US.UTF-8` (macOS default) and
+#    `C`/`C.UTF-8` (most CI runners). The hash pipeline pins `LC_ALL=C` so
+#    the file list ordering — and therefore the aggregate hash — is identical
+#    on every host.
 set -euo pipefail
+export LC_ALL=C
 
 MODE="${1:-generate}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

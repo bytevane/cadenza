@@ -11,12 +11,19 @@ artifacts drift on a future PR.
 
 ## Approach
 
-1. **Determinism fix in `scripts/codex-schema.sh`.** The upstream codex CLI
-   emits `codex_app_server_protocol.v2.schemas.json` with HashMap-ordered
-   top-level definitions, so two consecutive runs produce different bytes
-   for the same Codex version. Normalize every emitted JSON file through
-   `jq --sort-keys` before hashing. After this fix, three back-to-back local
-   runs all produce hash `12b1fa85dd22b9bbfa50dbc37c6856efc9b23c2dea4d2b52fe44218212cdd0be`.
+1. **Determinism fixes in `scripts/codex-schema.sh`.**
+   - The upstream codex CLI emits `codex_app_server_protocol.v2.schemas.json`
+     with HashMap-ordered top-level definitions, so two consecutive runs
+     produce different bytes for the same Codex version. Every emitted JSON
+     file is normalized through `jq --sort-keys` before hashing.
+   - `sort` uses LC_COLLATE-dependent ordering by default — macOS defaults
+     to `en_US.UTF-8` while most CI runners default to `C`/`C.UTF-8`. The
+     concatenation order, and therefore the aggregate hash, differs between
+     the two environments. The script pins `LC_ALL=C` so the file list is
+     ordered by bytes on every host.
+   - After both fixes, three back-to-back local runs on macOS-arm64 and
+     `codex-schema-gate` on Ubuntu-x86_64-musl all produce hash
+     `5d8ed6796ae5db6e4b019681c0416a7db06c03828447eb06a57ee94b663285ab`.
 
 2. **Tool gating in the script.** Add `jq` and `shasum` to the early
    pre-flight check so the script fails fast and loud with a clear message
