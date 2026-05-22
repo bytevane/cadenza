@@ -29,7 +29,7 @@ If any of the three gates' inputs changed, the regen + ADR procedure must be vis
 
 ### 2a. WIT ABI (`scripts/check-wit-abi.sh`)
 
-- [ ] If `wit/runtime.wit` changed, `abi/expected/runtime.wit` was regenerated in the **same commit**.
+- [ ] If `wit/runtime.wit` changed, `abi/expected/runtime.wit` was regenerated in the **same PR** (per `scripts/check-wit-abi.sh` and `docs/operations/wit-abi-versioning.md` — a separate snapshot commit on the same branch is fine).
 - [ ] If the plugin world changed, `abi/expected/cadenza-linear-graphql-plugin.world.wit` was regenerated.
 - [ ] WIT package version (`cadenza:runtime@X.Y.Z`) in `wit/runtime.wit` and `tools/versions.toml` (`wasm.wit_version`) agree.
 - [ ] An ADR under `decisions/` accompanies the change and explicitly says "additive-only" if the bump is meant to be non-breaking pre-1.0 (per `docs/operations/wit-abi-versioning.md`).
