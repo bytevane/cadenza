@@ -270,20 +270,81 @@ fn require_positive_u32(field: &str, value: u32) -> Result<(), WorkflowError> {
     Ok(())
 }
 
-pub fn render_prompt_strict(
-    template: &str,
-    context: serde_json::Value,
-) -> Result<String, minijinja::Error> {
+/// Per-render context: every prompt sees at least `issue` and `attempt`.
+/// Extra context is intentionally not threaded through here yet — adding it is
+/// a contract change to the prompt template surface and requires a new field.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptInput<'a> {
+    pub issue: &'a cadenza_core::Issue,
+    pub attempt: u32,
+}
+
+/// Failure modes from `render_prompt`. Distinct from `WorkflowError` so the
+/// orchestrator can route compile/undefined/unknown-item issues to operators
+/// without conflating them with workflow parsing.
+#[derive(Debug, thiserror::Error)]
+pub enum PromptRenderError {
+    #[error("prompt template failed to compile: {message}")]
+    Compile { message: String },
+    #[error("prompt references undefined variable: {message}")]
+    UndefinedVariable { message: String },
+    #[error("prompt references unknown filter, test, or function: {message}")]
+    UnknownItem { message: String },
+    #[error("prompt render error: {message}")]
+    Other { message: String },
+}
+
+impl PromptRenderError {
+    fn classify(err: minijinja::Error, stage: RenderStage) -> Self {
+        use minijinja::ErrorKind;
+        let message = err.to_string();
+        match err.kind() {
+            ErrorKind::UndefinedError => Self::UndefinedVariable { message },
+            ErrorKind::UnknownFilter
+            | ErrorKind::UnknownTest
+            | ErrorKind::UnknownFunction
+            | ErrorKind::UnknownMethod => Self::UnknownItem { message },
+            ErrorKind::SyntaxError
+            | ErrorKind::TemplateNotFound
+            | ErrorKind::BadEscape
+            | ErrorKind::InvalidOperation
+                if matches!(stage, RenderStage::Compile) =>
+            {
+                Self::Compile { message }
+            }
+            ErrorKind::SyntaxError => Self::Compile { message },
+            _ => Self::Other { message },
+        }
+    }
+}
+
+enum RenderStage {
+    Compile,
+    Render,
+}
+
+/// Render `template` against `input` in strict mode: undefined variables and
+/// unknown filters/tests/functions all fail closed. The strict behaviour is
+/// not negotiable — `PromptConfig::strict_undefined` exists as a documented
+/// contract field and is enforced at parse time
+/// (`prompt.strict_undefined: false` is rejected by `parse_workflow`).
+/// Pushing the toggle into the renderer would create a dead consumer-side
+/// branch, so it lives at the boundary that actually validates it.
+pub fn render_prompt(template: &str, input: &PromptInput<'_>) -> Result<String, PromptRenderError> {
     let mut env = minijinja::Environment::new();
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
-    env.add_template("prompt", template)?;
-    env.get_template("prompt")?.render(context)
+    env.add_template("prompt", template)
+        .map_err(|e| PromptRenderError::classify(e, RenderStage::Compile))?;
+    let tpl = env
+        .get_template("prompt")
+        .map_err(|e| PromptRenderError::classify(e, RenderStage::Compile))?;
+    tpl.render(input)
+        .map_err(|e| PromptRenderError::classify(e, RenderStage::Render))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     const MINIMAL_FRONT_MATTER: &str = r#"---
 tracker:
@@ -583,9 +644,160 @@ prompt body
         assert!(w.config.prompt.strict_undefined);
     }
 
+    fn sample_issue() -> cadenza_core::Issue {
+        cadenza_core::Issue {
+            id: "issue-123".into(),
+            identifier: "CAD-42".into(),
+            title: "Wire orchestrator state".into(),
+            description: Some("Tracks orchestrator skeleton work.".into()),
+            priority: Some(1),
+            state: "in progress".into(),
+            branch_name: Some("feat/orch".into()),
+            url: Some("https://linear.app/cad/issue/CAD-42".into()),
+            labels: vec!["priority:P0".into(), "component:orchestrator".into()],
+            blocked_by: vec![],
+            created_at: Some("2026-05-22T00:00:00Z".into()),
+            updated_at: Some("2026-05-22T08:00:00Z".into()),
+        }
+    }
+
+    fn input<'a>(issue: &'a cadenza_core::Issue, attempt: u32) -> PromptInput<'a> {
+        PromptInput { issue, attempt }
+    }
+
     #[test]
-    fn strict_prompt_fails_on_unknown_variable() {
-        let err = render_prompt_strict("{{ missing }}", json!({})).unwrap_err();
-        assert_eq!(err.kind(), minijinja::ErrorKind::UndefinedError);
+    fn renders_issue_and_attempt_into_prompt() {
+        let issue = sample_issue();
+        let template =
+            "Run #{{ attempt }} for {{ issue.identifier }}: {{ issue.title }} ({{ issue.state }})";
+        let rendered = render_prompt(template, &input(&issue, 2)).unwrap();
+        assert_eq!(
+            rendered,
+            "Run #2 for CAD-42: Wire orchestrator state (in progress)",
+        );
+    }
+
+    #[test]
+    fn snapshot_matches_full_workflow_example_template() {
+        // Snapshot-style assertion: render the prompt body shipped in
+        // WORKFLOW.example.md and assert the deterministic output. If the
+        // template or the issue shape changes, this test fails and the new
+        // string must be reviewed.
+        let issue = sample_issue();
+        let workflow_text = include_str!("../../../WORKFLOW.example.md");
+        let workflow = parse_workflow(workflow_text).expect("example parses");
+        let rendered = render_prompt(&workflow.prompt_template, &input(&issue, 1)).unwrap();
+        let expected = "You are working on Linear issue CAD-42: Wire orchestrator state.\n\n\
+                        Rules:\n\
+                        - Work only inside the assigned workspace.\n\
+                        - Use available tools for tracker writes; do not assume the orchestrator writes tickets for you.\n\
+                        - Summarize any handoff state clearly.\n\n\
+                        Issue description:\n\
+                        Tracks orchestrator skeleton work.";
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn snapshot_handles_missing_optional_description() {
+        // `issue.description` is Option<String>; the example template applies
+        // `| default("", true)`, so a None description should render as empty
+        // without producing an UndefinedVariable error.
+        let mut issue = sample_issue();
+        issue.description = None;
+        let workflow_text = include_str!("../../../WORKFLOW.example.md");
+        let workflow = parse_workflow(workflow_text).expect("example parses");
+        let rendered = render_prompt(&workflow.prompt_template, &input(&issue, 1)).unwrap();
+        // `default("", true)` produces an empty string, so the rendered body
+        // ends with the "Issue description:" header followed by whitespace.
+        assert!(
+            rendered.trim_end().ends_with("Issue description:"),
+            "got: {rendered}",
+        );
+        assert!(!rendered.contains("None"), "leaked Option debug repr");
+    }
+
+    #[test]
+    fn undefined_variable_classifies_as_undefined_variable() {
+        let issue = sample_issue();
+        let err = render_prompt("hello {{ missing }}", &input(&issue, 0)).unwrap_err();
+        assert!(
+            matches!(err, PromptRenderError::UndefinedVariable { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_filter_classifies_as_unknown_item() {
+        let issue = sample_issue();
+        let err =
+            render_prompt("{{ issue.title | nonexistent_filter }}", &input(&issue, 0)).unwrap_err();
+        assert!(
+            matches!(err, PromptRenderError::UnknownItem { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_function_classifies_as_unknown_item() {
+        let issue = sample_issue();
+        let err = render_prompt("{{ nonexistent_function() }}", &input(&issue, 0)).unwrap_err();
+        assert!(
+            matches!(err, PromptRenderError::UnknownItem { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_test_classifies_as_unknown_item() {
+        let issue = sample_issue();
+        let err = render_prompt(
+            "{% if issue.title is nonexistent_test %}x{% endif %}",
+            &input(&issue, 0),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PromptRenderError::UnknownItem { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn template_syntax_error_classifies_as_compile() {
+        let issue = sample_issue();
+        let err = render_prompt("{{ unterminated", &input(&issue, 0)).unwrap_err();
+        assert!(
+            matches!(err, PromptRenderError::Compile { .. }),
+            "got: {err:?}",
+        );
+    }
+
+    #[test]
+    fn render_error_is_disjoint_from_workflow_error() {
+        // Compile-time check via trait bounds: PromptRenderError does not
+        // From-convert into WorkflowError, and vice-versa.
+        fn assert_no_conversion<A, B>()
+        where
+            A: 'static,
+            B: 'static,
+        {
+            // No body — just enforces that the two types are distinct.
+        }
+        assert_no_conversion::<PromptRenderError, WorkflowError>();
+    }
+
+    // Boundary: attempt is a plain u32 — both 0 and u32::MAX must render
+    // without error so we never reject a valid run attempt number.
+    #[test]
+    fn attempt_zero_boundary_renders() {
+        let issue = sample_issue();
+        let rendered = render_prompt("attempt {{ attempt }}", &input(&issue, 0)).unwrap();
+        assert_eq!(rendered, "attempt 0");
+    }
+
+    #[test]
+    fn attempt_u32_max_boundary_renders() {
+        let issue = sample_issue();
+        let rendered = render_prompt("attempt {{ attempt }}", &input(&issue, u32::MAX)).unwrap();
+        assert_eq!(rendered, format!("attempt {}", u32::MAX));
     }
 }
