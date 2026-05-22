@@ -1,0 +1,118 @@
+//! Contract registry helpers.
+//!
+//! `tools/versions.toml` is the single ledger pinning the upstream facts that
+//! Cadenza targets. These helpers operate on a TOML body **as text** so the
+//! checks do not depend on a TOML parser and can run from any crate.
+
+/// MVP-critical keys that must be pinned to a concrete value (no `TODO`
+/// placeholder) in `tools/versions.toml`. Adding a new MVP-critical contract
+/// means appending here and adding its acceptance test.
+pub const MVP_CRITICAL_KEYS: &[&str] = &[
+    "symphony_spec_sha",
+    "cli_version",
+    "toolchain_version",
+    "wasmtime_version",
+    "wasm_tools_version",
+    "wit_bindgen_version",
+];
+
+const TODO_MARKER: &str = "TODO";
+
+/// Return every line in `body` that names an MVP-critical key but still
+/// carries a `TODO` placeholder in its value.
+pub fn pending_mvp_critical_keys(body: &str) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for raw in body.lines() {
+        let line = raw.trim_start();
+        if !line.contains(TODO_MARKER) {
+            continue;
+        }
+        for key in MVP_CRITICAL_KEYS {
+            if line.starts_with(key) {
+                offenders.push(line.to_string());
+                break;
+            }
+        }
+    }
+    offenders
+}
+
+/// Return MVP-critical keys that are not mentioned anywhere in `body`.
+pub fn missing_mvp_critical_keys(body: &str) -> Vec<&'static str> {
+    MVP_CRITICAL_KEYS
+        .iter()
+        .copied()
+        .filter(|key| !body.lines().any(|line| line.trim_start().starts_with(key)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_PINNED: &str = r#"
+symphony_spec_sha = "deadbeef"
+cli_version = "rust-v0.133.0"
+toolchain_version = "1.95.0"
+wasmtime_version = "45.0.0"
+wasm_tools_version = "1.250.0"
+wit_bindgen_version = "0.57.1"
+"#;
+
+    #[test]
+    fn exactly_n_keys_filled_yields_no_offenders_and_no_missing() {
+        assert!(pending_mvp_critical_keys(ALL_PINNED).is_empty());
+        assert!(missing_mvp_critical_keys(ALL_PINNED).is_empty());
+    }
+
+    #[test]
+    fn n_plus_one_with_extra_unrelated_key_still_passes() {
+        let body = format!("{ALL_PINNED}\nunrelated_key = \"TODO-something\"\n");
+        assert!(pending_mvp_critical_keys(&body).is_empty());
+        assert!(missing_mvp_critical_keys(&body).is_empty());
+    }
+
+    #[test]
+    fn upper_edge_single_todo_returns_single_offender() {
+        let body = ALL_PINNED.replace(
+            r#"symphony_spec_sha = "deadbeef""#,
+            r#"symphony_spec_sha = "TODO-pin""#,
+        );
+        let offenders = pending_mvp_critical_keys(&body);
+        assert_eq!(offenders.len(), 1, "got: {offenders:?}");
+        assert!(offenders[0].starts_with("symphony_spec_sha"));
+    }
+
+    #[test]
+    fn lower_edge_single_missing_key_is_reported() {
+        let body = ALL_PINNED.replace("wit_bindgen_version", "wit_bindgen_renamed");
+        let missing = missing_mvp_critical_keys(&body);
+        assert_eq!(missing, vec!["wit_bindgen_version"]);
+    }
+
+    #[test]
+    fn todo_marker_in_comment_lines_is_ignored_when_key_not_at_line_start() {
+        let body = format!("# TODO revisit later\n{ALL_PINNED}");
+        assert!(pending_mvp_critical_keys(&body).is_empty());
+    }
+
+    #[test]
+    fn registry_text_has_no_pending_critical_keys() {
+        let body = include_str!("../../../tools/versions.toml");
+        let offenders = pending_mvp_critical_keys(body);
+        assert!(
+            offenders.is_empty(),
+            "tools/versions.toml has unresolved MVP-critical TODOs: {offenders:?}",
+        );
+    }
+
+    #[test]
+    fn registry_text_documents_every_critical_key() {
+        let body = include_str!("../../../tools/versions.toml");
+        let missing = missing_mvp_critical_keys(body);
+        assert!(
+            missing.is_empty(),
+            "tools/versions.toml is missing MVP-critical keys: {missing:?}",
+        );
+    }
+}

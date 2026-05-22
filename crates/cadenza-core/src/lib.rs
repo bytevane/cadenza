@@ -1,3 +1,5 @@
+pub mod contracts;
+
 use serde::{Deserialize, Serialize};
 
 /// Normalized issue record used by orchestration, prompt rendering, and observability.
