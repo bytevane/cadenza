@@ -1,0 +1,546 @@
+//! Defensive WORKFLOW.md hot reload primitives.
+//!
+//! `WorkflowSource` owns the active workflow definition behind an
+//! atomic Arc swap and preserves the last-known-good config on any
+//! reload failure. `WorkflowWatcher` wraps a `notify` watcher that
+//! drives `try_reload` whenever the file changes on disk. The
+//! orchestrator never gets a mutable handle to the source — it pulls
+//! `Arc<WorkflowDefinition>` via `current()` and reloads happen on
+//! their own thread.
+
+use std::collections::VecDeque;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
+
+use thiserror::Error;
+
+use crate::{WorkflowDefinition, WorkflowError, parse_workflow};
+
+/// How many past reload events to keep for operator visibility.
+const HISTORY_CAPACITY: usize = 16;
+
+#[derive(Debug, Error)]
+pub enum WorkflowSourceError {
+    #[error("failed to read workflow file {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("workflow rejected: {0}")]
+    Workflow(#[from] WorkflowError),
+}
+
+#[derive(Debug, Clone)]
+pub struct ReloadEvent {
+    pub at: SystemTime,
+    pub outcome: ReloadOutcome,
+}
+
+#[derive(Debug, Clone)]
+pub enum ReloadOutcome {
+    /// Reload succeeded; the active config moved to this version.
+    Loaded { version: u64 },
+    /// Reload was rejected. `reason` is the rendered error string so
+    /// operators can see it in a state snapshot without re-running
+    /// the parser.
+    Rejected { reason: String },
+}
+
+#[derive(Debug, Error)]
+pub enum WatchError {
+    #[error("notify failed to create watcher: {0}")]
+    Notify(#[from] notify::Error),
+}
+
+/// Atomic-swap workflow holder. Cheap to clone via `Arc<WorkflowSource>`.
+#[derive(Debug)]
+pub struct WorkflowSource {
+    path: PathBuf,
+    state: RwLock<State>,
+}
+
+#[derive(Debug)]
+struct State {
+    current: Arc<WorkflowDefinition>,
+    version: u64,
+    last_event: ReloadEvent,
+    history: VecDeque<ReloadEvent>,
+}
+
+impl WorkflowSource {
+    /// Read and validate the file at `path`. On success the source is
+    /// at version 1 with one `Loaded` event in history. On failure no
+    /// `WorkflowSource` is constructed (we have nothing to fall back to).
+    pub fn load_initial(path: impl Into<PathBuf>) -> Result<Self, WorkflowSourceError> {
+        let path = path.into();
+        let bytes = fs::read_to_string(&path).map_err(|e| WorkflowSourceError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
+        let definition = parse_workflow(&bytes)?;
+        let event = ReloadEvent {
+            at: SystemTime::now(),
+            outcome: ReloadOutcome::Loaded { version: 1 },
+        };
+        let mut history = VecDeque::with_capacity(HISTORY_CAPACITY);
+        history.push_back(event.clone());
+        Ok(Self {
+            path,
+            state: RwLock::new(State {
+                current: Arc::new(definition),
+                version: 1,
+                last_event: event,
+                history,
+            }),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns a cheap `Arc` clone of the last-known-good definition. The
+    /// orchestrator stores this and re-pulls when its own tick logic decides
+    /// it is safe — it never mutates through this handle.
+    pub fn current(&self) -> Arc<WorkflowDefinition> {
+        Arc::clone(
+            &self
+                .state
+                .read()
+                .expect("source state lock poisoned")
+                .current,
+        )
+    }
+
+    pub fn version(&self) -> u64 {
+        self.state
+            .read()
+            .expect("source state lock poisoned")
+            .version
+    }
+
+    pub fn last_event(&self) -> ReloadEvent {
+        self.state
+            .read()
+            .expect("source state lock poisoned")
+            .last_event
+            .clone()
+    }
+
+    pub fn history(&self) -> Vec<ReloadEvent> {
+        self.state
+            .read()
+            .expect("source state lock poisoned")
+            .history
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Re-read the file, re-parse, and atomically swap in the new
+    /// definition on success. On any failure the existing
+    /// `current()` is preserved (last-known-good) and a `Rejected`
+    /// event is recorded so the operator can see what happened.
+    ///
+    /// **File I/O happens inside the write lock.** Reading outside the
+    /// lock would let two concurrent callers race: A reads stale bytes,
+    /// B reads fresh bytes and commits first, then A overwrites `current`
+    /// with stale data while still bumping the version. Holding the lock
+    /// across `fs::read_to_string` + parse is the simplest path to a
+    /// linearizable last-known-good guarantee. The reload itself reads a
+    /// small Markdown file, so the lock contention is acceptable.
+    pub fn try_reload(&self) -> ReloadOutcome {
+        let outcome = {
+            let mut state = self.state.write().expect("source state lock poisoned");
+            let outcome = match fs::read_to_string(&self.path)
+                .map_err(|e| WorkflowSourceError::Io {
+                    path: self.path.clone(),
+                    source: e,
+                })
+                .and_then(|s| parse_workflow(&s).map_err(WorkflowSourceError::from))
+            {
+                Ok(definition) => {
+                    state.version = state.version.saturating_add(1);
+                    state.current = Arc::new(definition);
+                    ReloadOutcome::Loaded {
+                        version: state.version,
+                    }
+                }
+                Err(err) => ReloadOutcome::Rejected {
+                    reason: err.to_string(),
+                },
+            };
+            let event = ReloadEvent {
+                at: SystemTime::now(),
+                outcome: outcome.clone(),
+            };
+            state.last_event = event.clone();
+            if state.history.len() == HISTORY_CAPACITY {
+                state.history.pop_front();
+            }
+            state.history.push_back(event);
+            outcome
+        };
+
+        match &outcome {
+            ReloadOutcome::Rejected { reason } => tracing::warn!(
+                target: "cadenza.workflow.reload",
+                path = %self.path.display(),
+                error = reason.as_str(),
+                "workflow reload rejected, keeping last-known-good",
+            ),
+            ReloadOutcome::Loaded { version } => tracing::info!(
+                target: "cadenza.workflow.reload",
+                path = %self.path.display(),
+                version = version,
+                "workflow reload succeeded",
+            ),
+        }
+        outcome
+    }
+}
+
+/// `notify`-based watcher. Constructs a recommended watcher that calls
+/// `source.try_reload()` whenever the watched file changes. The watcher
+/// is held by-value; dropping it stops watching.
+pub struct WorkflowWatcher {
+    _watcher: notify::RecommendedWatcher,
+    source: Arc<WorkflowSource>,
+}
+
+impl WorkflowWatcher {
+    /// Watch the **parent directory** rather than the file itself. Editors
+    /// commonly save by writing a sibling tempfile and renaming it over
+    /// the target; a watch on the original inode would silently lose
+    /// updates after the first such save. The callback filters incoming
+    /// notify events by basename so unrelated parent-dir changes are
+    /// ignored.
+    pub fn spawn(source: Arc<WorkflowSource>) -> Result<Self, WatchError> {
+        use std::ffi::OsString;
+
+        use notify::{EventKind, RecursiveMode, Watcher};
+
+        let path = source.path().to_path_buf();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let filename: OsString = path
+            .file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_else(|| OsString::from(""));
+        let source_for_cb = Arc::clone(&source);
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                let event = match res {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "cadenza.workflow.reload",
+                            error = %e,
+                            "notify reported an error event, ignoring",
+                        );
+                        return;
+                    }
+                };
+                if !matches!(
+                    event.kind,
+                    EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                ) {
+                    return;
+                }
+                let touches_target = event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name().is_some_and(|n| n == filename));
+                if touches_target {
+                    source_for_cb.try_reload();
+                }
+            })?;
+        watcher.watch(&parent, RecursiveMode::NonRecursive)?;
+        Ok(Self {
+            _watcher: watcher,
+            source,
+        })
+    }
+
+    pub fn source(&self) -> &Arc<WorkflowSource> {
+        &self.source
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    const VALID_BODY: &str = r#"---
+tracker:
+  kind: linear
+  token: "secret"
+workspace:
+  root: "/tmp/cadenza/workspaces"
+codex:
+  command: "codex app-server --listen stdio://"
+orchestrator:
+  active_states: ["todo"]
+  terminal_states: ["done"]
+---
+prompt body
+"#;
+
+    fn make_tempfile(body: &str) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().expect("create tempfile");
+        f.write_all(body.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        f
+    }
+
+    fn rewrite(file: &tempfile::NamedTempFile, body: &str) {
+        fs::write(file.path(), body).expect("rewrite");
+    }
+
+    #[test]
+    fn load_initial_succeeds_on_valid_file_with_version_one() {
+        let f = make_tempfile(VALID_BODY);
+        let src = WorkflowSource::load_initial(f.path()).expect("load_initial");
+        assert_eq!(src.version(), 1);
+        assert!(matches!(
+            src.last_event().outcome,
+            ReloadOutcome::Loaded { version: 1 }
+        ));
+    }
+
+    #[test]
+    fn load_initial_fails_on_missing_file() {
+        let path = PathBuf::from("/nonexistent/cadenza-test-workflow.md");
+        let err = WorkflowSource::load_initial(path).unwrap_err();
+        assert!(matches!(err, WorkflowSourceError::Io { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn load_initial_fails_on_invalid_workflow() {
+        let f = make_tempfile("not even front matter");
+        let err = WorkflowSource::load_initial(f.path()).unwrap_err();
+        assert!(
+            matches!(err, WorkflowSourceError::Workflow(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reload_with_valid_change_bumps_version_and_swaps() {
+        let f = make_tempfile(VALID_BODY);
+        let src = WorkflowSource::load_initial(f.path()).unwrap();
+        assert_eq!(src.version(), 1);
+        let before = src.current();
+
+        let bumped = VALID_BODY.replace(r#"token: "secret""#, r#"token: "rotated""#);
+        rewrite(&f, &bumped);
+        let outcome = src.try_reload();
+
+        assert!(matches!(outcome, ReloadOutcome::Loaded { version: 2 }));
+        assert_eq!(src.version(), 2);
+        let after = src.current();
+        assert_eq!(before.config.tracker.token, "secret");
+        assert_eq!(after.config.tracker.token, "rotated");
+    }
+
+    #[test]
+    fn reload_with_invalid_yaml_preserves_last_known_good() {
+        let f = make_tempfile(VALID_BODY);
+        let src = WorkflowSource::load_initial(f.path()).unwrap();
+        let before_arc = src.current();
+        let before_version = src.version();
+
+        rewrite(&f, "---\n: : bogus yaml\n---\nbody");
+        let outcome = src.try_reload();
+
+        assert!(
+            matches!(outcome, ReloadOutcome::Rejected { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            src.version(),
+            before_version,
+            "version must not move on reject"
+        );
+        assert!(Arc::ptr_eq(&before_arc, &src.current()));
+        match src.last_event().outcome {
+            ReloadOutcome::Rejected { reason } => assert!(reason.contains("YAML")),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_with_invalid_validation_preserves_last_known_good() {
+        let f = make_tempfile(VALID_BODY);
+        let src = WorkflowSource::load_initial(f.path()).unwrap();
+        let before_version = src.version();
+
+        // Empty token is a validation failure, not a YAML parse failure.
+        let bumped = VALID_BODY.replace(r#"token: "secret""#, r#"token: """#);
+        rewrite(&f, &bumped);
+        let outcome = src.try_reload();
+
+        assert!(
+            matches!(outcome, ReloadOutcome::Rejected { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(src.version(), before_version);
+        match src.last_event().outcome {
+            ReloadOutcome::Rejected { reason } => assert!(reason.contains("tracker.token")),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_after_file_removed_preserves_last_known_good() {
+        let f = make_tempfile(VALID_BODY);
+        let src = WorkflowSource::load_initial(f.path()).unwrap();
+        let before_version = src.version();
+        let before_arc = src.current();
+        let path = f.path().to_path_buf();
+        drop(f); // removes the tempfile
+        assert!(!path.exists());
+
+        let outcome = src.try_reload();
+        assert!(
+            matches!(outcome, ReloadOutcome::Rejected { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(src.version(), before_version);
+        assert!(Arc::ptr_eq(&before_arc, &src.current()));
+    }
+
+    // Boundary law: history is bounded at HISTORY_CAPACITY. Verify =N
+    // (exact-fit) and =N+1 (drop-oldest).
+    #[test]
+    fn history_at_capacity_keeps_all_events() {
+        let f = make_tempfile(VALID_BODY);
+        let src = WorkflowSource::load_initial(f.path()).unwrap();
+        // load_initial already pushed one event, so push HISTORY_CAPACITY - 1 more.
+        for _ in 1..HISTORY_CAPACITY {
+            src.try_reload(); // no-op edits still count as Loaded events
+        }
+        assert_eq!(src.history().len(), HISTORY_CAPACITY);
+    }
+
+    #[test]
+    fn history_beyond_capacity_drops_oldest() {
+        let f = make_tempfile(VALID_BODY);
+        let src = WorkflowSource::load_initial(f.path()).unwrap();
+        for _ in 0..HISTORY_CAPACITY {
+            src.try_reload();
+        }
+        let history = src.history();
+        assert_eq!(history.len(), HISTORY_CAPACITY);
+        // The earliest event would have been version=1; after overflow the
+        // oldest retained version must be > 1.
+        match &history[0].outcome {
+            ReloadOutcome::Loaded { version } => assert!(
+                *version > 1,
+                "expected oldest event version > 1 after overflow, got {version}",
+            ),
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_reloads_never_publish_stale_snapshot() {
+        // Race regression: two threads call try_reload after the file is
+        // updated to a known-fresh value. Whichever thread wins the lock
+        // last must observe the same fresh content — the version and the
+        // active config must never disagree, and no stale-content event
+        // can be recorded after a fresher reload completed.
+        let f = make_tempfile(VALID_BODY);
+        let src = Arc::new(WorkflowSource::load_initial(f.path()).unwrap());
+        let bumped = VALID_BODY.replace(r#"token: "secret""#, r#"token: "fresh""#);
+        rewrite(&f, &bumped);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let src = Arc::clone(&src);
+                std::thread::spawn(move || src.try_reload())
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("reload thread");
+        }
+
+        // After all threads complete: version moved by exactly 8 (one bump
+        // per call), the active config reflects the fresh bytes, and the
+        // most recent recorded event matches the active version.
+        assert_eq!(src.version(), 1 + 8);
+        assert_eq!(src.current().config.tracker.token, "fresh");
+        match src.last_event().outcome {
+            ReloadOutcome::Loaded { version } => assert_eq!(version, src.version()),
+            other => panic!("expected last event Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watcher_picks_up_replace_via_rename() {
+        // Many editors (Vim, IntelliJ, etc.) save by writing a sibling
+        // tempfile and renaming it over the target. Watching the file
+        // directly loses the inode and stops delivering events; the
+        // watcher must observe the parent directory and filter by name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        fs::write(&path, VALID_BODY).unwrap();
+        let src = Arc::new(WorkflowSource::load_initial(&path).unwrap());
+        let _watcher = WorkflowWatcher::spawn(Arc::clone(&src)).expect("spawn watcher");
+
+        let tmp = dir.path().join("WORKFLOW.md.tmp");
+        let bumped = VALID_BODY.replace(r#"token: "secret""#, r#"token: "renamed""#);
+        fs::write(&tmp, &bumped).unwrap();
+        fs::rename(&tmp, &path).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if src.version() >= 2 && src.current().config.tracker.token == "renamed" {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "watcher did not pick up rename-replace within 5s; last_event = {:?}, version = {}",
+                    src.last_event(),
+                    src.version(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn watcher_picks_up_valid_change() {
+        let f = make_tempfile(VALID_BODY);
+        let src = Arc::new(WorkflowSource::load_initial(f.path()).unwrap());
+        let _watcher = WorkflowWatcher::spawn(Arc::clone(&src)).expect("spawn watcher");
+
+        // Rewrite the file with a valid edit and poll until the watcher
+        // observes it. Hard cap so the test cannot hang indefinitely.
+        let bumped = VALID_BODY.replace(r#"token: "secret""#, r#"token: "watched""#);
+        rewrite(&f, &bumped);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if src.version() >= 2 && src.current().config.tracker.token == "watched" {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "watcher did not pick up the change within 5s; last_event = {:?}, version = {}",
+                    src.last_event(),
+                    src.version(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
