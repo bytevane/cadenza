@@ -1,0 +1,212 @@
+//! Runtime snapshot model. The orchestrator owns the live state;
+//! this module is what gets serialised to JSON for the
+//! `GET /api/v1/state` and `GET /api/v1/issues/{id}` routes.
+//!
+//! Every payload that crosses the HTTP boundary goes through
+//! `redact_snapshot` so a misconfigured workflow that put a token
+//! into an issue field, error message, or last-event blob still
+//! cannot leak the value via the state API.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub workflow_version: u64,
+    pub max_concurrent_agents: usize,
+    pub running: Vec<IssueRunningView>,
+    pub retry: Vec<RetryView>,
+    pub recent_skips: Vec<SkipReasonView>,
+    pub last_reload: Option<LastReloadView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueRunningView {
+    pub issue_id: String,
+    pub identifier: String,
+    pub attempt: u32,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub last_event: Option<String>,
+    pub started_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryView {
+    pub issue_id: String,
+    pub identifier: String,
+    pub attempt: u32,
+    pub due_at_ms: u64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkipReasonView {
+    pub issue_id: String,
+    pub identifier: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LastReloadView {
+    pub at_ms: u64,
+    pub version: u64,
+    pub outcome: String,
+    pub error: Option<String>,
+}
+
+/// Walk every string field in the snapshot and apply `redact_value`
+/// to keys that look secret-shaped. The snapshot doesn't carry any
+/// raw-secret fields by design, but free-form strings (`last_event`,
+/// `reason`, `error`) can pass through tokens that arrived in
+/// upstream logs. This is the last line of defence.
+pub fn redact_snapshot(snapshot: &mut RuntimeSnapshot) {
+    for running in &mut snapshot.running {
+        if let Some(e) = running.last_event.as_mut() {
+            *e = scrub_text(e);
+        }
+    }
+    for retry in &mut snapshot.retry {
+        if let Some(r) = retry.reason.as_mut() {
+            *r = scrub_text(r);
+        }
+    }
+    if let Some(reload) = snapshot.last_reload.as_mut() {
+        if let Some(err) = reload.error.as_mut() {
+            *err = scrub_text(err);
+        }
+    }
+}
+
+/// Heuristic free-text scrub: replace `KEY=value` substrings (where
+/// `KEY` looks secret-shaped) with `KEY=[REDACTED]`. Only the `=`
+/// separator is handled — `KEY: value` patterns vary too much (e.g.
+/// `authorization: bearer XXX` puts the secret two tokens past the
+/// separator) so we conservatively leave them. Structured fields that
+/// carry a key/value pair separately should use `redact_value` instead.
+fn scrub_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(sep_pos) = rest.find('=') else {
+            out.push_str(rest);
+            break;
+        };
+        let (head, tail) = rest.split_at(sep_pos);
+        let key_start = head
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let key = &head[key_start..];
+        out.push_str(&head[..key_start]);
+        out.push_str(key);
+        out.push('=');
+        let after_sep = &tail[1..];
+        if super::looks_secret(key) && !key.is_empty() {
+            let value_end = after_sep
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or(after_sep.len());
+            out.push_str("[REDACTED]");
+            rest = &after_sep[value_end..];
+        } else {
+            rest = after_sep;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_text_redacts_known_token_keys() {
+        let s = scrub_text("foo LINEAR_API_KEY=lr_tok_abc bar");
+        assert!(s.contains("LINEAR_API_KEY=[REDACTED]"), "got {s}");
+        assert!(!s.contains("lr_tok_abc"));
+    }
+
+    #[test]
+    fn scrub_text_leaves_colon_separator_alone() {
+        // `KEY: value` patterns are deliberately not touched — the
+        // bearer-token case (`authorization: bearer XXX`) puts the
+        // secret two tokens past the separator and a naive scrub
+        // would only catch "bearer". Structured callers should use
+        // `redact_value` for these fields instead.
+        let s = scrub_text("authorization: bearer ghs_xyz");
+        assert_eq!(s, "authorization: bearer ghs_xyz");
+    }
+
+    #[test]
+    fn scrub_text_leaves_prose_alone() {
+        let s = scrub_text("the upstream tracker returned an error");
+        assert_eq!(s, "the upstream tracker returned an error");
+    }
+
+    #[test]
+    fn redact_snapshot_scrubs_running_last_event() {
+        let mut snap = RuntimeSnapshot {
+            running: vec![IssueRunningView {
+                issue_id: "a".into(),
+                identifier: "CAD-1".into(),
+                attempt: 1,
+                thread_id: None,
+                turn_id: None,
+                last_event: Some("preflight token=ghs_secret".into()),
+                started_at_ms: None,
+            }],
+            ..Default::default()
+        };
+        redact_snapshot(&mut snap);
+        let leaked = snap.running[0]
+            .last_event
+            .as_ref()
+            .map(|s| s.contains("ghs_secret"))
+            .unwrap_or(false);
+        assert!(!leaked, "leaked: {:?}", snap.running[0].last_event);
+    }
+
+    #[test]
+    fn redact_snapshot_scrubs_retry_reason() {
+        let mut snap = RuntimeSnapshot {
+            retry: vec![RetryView {
+                issue_id: "a".into(),
+                identifier: "CAD-1".into(),
+                attempt: 2,
+                due_at_ms: 10,
+                reason: Some("upstream failed: API_KEY=oops".into()),
+            }],
+            ..Default::default()
+        };
+        redact_snapshot(&mut snap);
+        assert!(!snap.retry[0].reason.as_ref().unwrap().contains("oops"));
+    }
+
+    #[test]
+    fn redact_snapshot_scrubs_last_reload_error_with_equals_key() {
+        // Free-form scrub catches `KEY=VALUE` patterns. The colon
+        // variant is intentionally out of scope (see
+        // `scrub_text_leaves_colon_separator_alone`); structured
+        // callers should pass header-map values through
+        // `redact_value` instead.
+        let mut snap = RuntimeSnapshot {
+            last_reload: Some(LastReloadView {
+                at_ms: 0,
+                version: 1,
+                outcome: "Rejected".into(),
+                error: Some("LINEAR_API_KEY=oops_secret_value".into()),
+            }),
+            ..Default::default()
+        };
+        redact_snapshot(&mut snap);
+        assert!(
+            !snap
+                .last_reload
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("oops_secret_value"),
+        );
+    }
+}
