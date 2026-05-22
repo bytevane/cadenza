@@ -87,15 +87,23 @@ impl HookRunner {
             return Err(HookLaunchError::WorkspaceMissing(self.workspace.clone()));
         }
 
-        let mut child = Command::new("sh")
-            .arg("-c")
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
             .arg(&hook.command)
             .current_dir(&self.workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(HookLaunchError::Spawn)?;
+            .stderr(Stdio::piped());
+        // Run sh as its own process-group leader so a kill on timeout
+        // reaches every grandchild (e.g. `sleep` under `sh -c`). Without
+        // this the orphaned grandchild keeps the stdio pipes open and
+        // the reader threads block until it exits on its own.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().map_err(HookLaunchError::Spawn)?;
 
         let stdout = child
             .stdout
@@ -119,7 +127,7 @@ impl HookRunner {
                 Ok(Some(_status)) => break,
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
+                        kill_process_group(&mut child);
                         let _ = child.wait();
                         timed_out = true;
                         break;
@@ -208,6 +216,23 @@ impl BoundedBuf {
         }
         out
     }
+}
+
+/// Send SIGKILL to the entire process group spawned for the hook so
+/// grandchildren like `sleep` (under `sh -c "sleep 5"`) die immediately
+/// and release their end of the stdio pipes. On non-unix platforms we
+/// fall back to `Child::kill`.
+fn kill_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        // SAFETY: pid is a valid PID owned by us; killpg with SIGKILL has
+        // no preconditions beyond a valid pgid.
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 fn spawn_reader<R: Read + Send + 'static>(
