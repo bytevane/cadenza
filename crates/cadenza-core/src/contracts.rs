@@ -18,7 +18,18 @@ pub const MVP_CRITICAL_KEYS: &[&str] = &[
 
 const TODO_MARKER: &str = "TODO";
 
-/// Return every line in `body` that names an MVP-critical key but still
+/// True iff `line` (already trimmed of leading whitespace) is a TOML
+/// assignment whose key is exactly `key`. A bare key followed by optional
+/// whitespace and `=` qualifies; prefixed keys like `wasmtime_version_backup`
+/// do not.
+fn line_assigns_key(line: &str, key: &str) -> bool {
+    let Some(rest) = line.strip_prefix(key) else {
+        return false;
+    };
+    matches!(rest.bytes().next(), Some(b' ' | b'\t' | b'=')) && rest.trim_start().starts_with('=')
+}
+
+/// Return every line in `body` that assigns an MVP-critical key but still
 /// carries a `TODO` placeholder in its value.
 pub fn pending_mvp_critical_keys(body: &str) -> Vec<String> {
     let mut offenders = Vec::new();
@@ -28,7 +39,7 @@ pub fn pending_mvp_critical_keys(body: &str) -> Vec<String> {
             continue;
         }
         for key in MVP_CRITICAL_KEYS {
-            if line.starts_with(key) {
+            if line_assigns_key(line, key) {
                 offenders.push(line.to_string());
                 break;
             }
@@ -37,12 +48,16 @@ pub fn pending_mvp_critical_keys(body: &str) -> Vec<String> {
     offenders
 }
 
-/// Return MVP-critical keys that are not mentioned anywhere in `body`.
+/// Return MVP-critical keys that are not assigned anywhere in `body`.
 pub fn missing_mvp_critical_keys(body: &str) -> Vec<&'static str> {
     MVP_CRITICAL_KEYS
         .iter()
         .copied()
-        .filter(|key| !body.lines().any(|line| line.trim_start().starts_with(key)))
+        .filter(|key| {
+            !body
+                .lines()
+                .any(|line| line_assigns_key(line.trim_start(), key))
+        })
         .collect()
 }
 
@@ -94,6 +109,41 @@ wit_bindgen_version = "0.57.1"
     fn todo_marker_in_comment_lines_is_ignored_when_key_not_at_line_start() {
         let body = format!("# TODO revisit later\n{ALL_PINNED}");
         assert!(pending_mvp_critical_keys(&body).is_empty());
+    }
+
+    #[test]
+    fn suffixed_prefix_key_does_not_satisfy_presence() {
+        // `wasmtime_version` removed, `wasmtime_version_backup` added — must
+        // still report wasmtime_version as missing.
+        let body = ALL_PINNED.replace(
+            r#"wasmtime_version = "45.0.0""#,
+            r#"wasmtime_version_backup = "45.0.0""#,
+        );
+        let missing = missing_mvp_critical_keys(&body);
+        assert_eq!(missing, vec!["wasmtime_version"]);
+    }
+
+    #[test]
+    fn suffixed_prefix_key_with_todo_is_not_an_offender() {
+        let body = ALL_PINNED.replace(
+            r#"wasmtime_version = "45.0.0""#,
+            r#"wasmtime_version_backup = "TODO-foo"
+wasmtime_version = "45.0.0""#,
+        );
+        assert!(
+            pending_mvp_critical_keys(&body).is_empty(),
+            "{:?}",
+            pending_mvp_critical_keys(&body),
+        );
+    }
+
+    #[test]
+    fn assignment_without_space_around_equals_is_still_recognised() {
+        let body = ALL_PINNED.replace(
+            r#"wit_bindgen_version = "0.57.1""#,
+            r#"wit_bindgen_version="0.57.1""#,
+        );
+        assert!(missing_mvp_critical_keys(&body).is_empty());
     }
 
     #[test]
