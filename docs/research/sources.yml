@@ -1,4 +1,4 @@
-checked_on: 2026-05-22
+checked_on: "2026-05-22"
 sources:
   - name: Symphony SPEC
     url: https://github.com/openai/symphony/blob/main/SPEC.md
