@@ -67,7 +67,13 @@ impl HookRunner {
     }
 
     pub fn with_secrets(mut self, secrets: Vec<String>) -> Self {
-        self.secrets = secrets.into_iter().filter(|s| !s.is_empty()).collect();
+        // Apply longest secrets first. Otherwise a shorter prefix
+        // (`"abc"`) consumed before a superset (`"abcdef"`) would leave
+        // the unmatched suffix `def` in the captured output even though
+        // the longer secret was registered.
+        let mut secrets: Vec<String> = secrets.into_iter().filter(|s| !s.is_empty()).collect();
+        secrets.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+        self.secrets = secrets;
         self
     }
 
@@ -129,6 +135,7 @@ impl HookRunner {
             .checked_add(timeout)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(24 * 60 * 60));
         let mut timed_out = false;
+        let mut wait_error: Option<io::Error> = None;
         loop {
             match child.try_wait() {
                 Ok(Some(_status)) => break,
@@ -139,15 +146,23 @@ impl HookRunner {
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
-                Err(e) => return Err(HookLaunchError::Spawn(e)),
+                Err(e) => {
+                    // Transient try_wait failure (e.g. EINTR). Treat it
+                    // like a timeout: kill the group, drain readers, then
+                    // surface the error after cleanup so the hook does
+                    // not leak a running child while reader threads
+                    // block on its pipes.
+                    wait_error = Some(e);
+                    break;
+                }
             }
         }
 
-        // Always SIGKILL the whole process group, even on success. A hook
-        // like `sleep 300 &` lets sh exit immediately but leaves an
-        // orphaned background grandchild holding the stdio pipes; without
-        // this kill, joining the reader threads would block until that
-        // grandchild died on its own.
+        // Always SIGKILL the whole process group — even on success or on a
+        // try_wait error. A hook like `sleep 300 &` lets sh exit
+        // immediately but leaves an orphaned background grandchild
+        // holding the stdio pipes; without this kill, joining the reader
+        // threads would block until that grandchild died on its own.
         kill_process_group(&mut child);
         let _ = child.wait();
 
@@ -158,6 +173,10 @@ impl HookRunner {
         let stderr = stderr_buf.lock().expect("stderr buf poisoned").finish();
         let stdout = self.redact(stdout);
         let stderr = self.redact(stderr);
+
+        if let Some(err) = wait_error {
+            return Err(HookLaunchError::Spawn(err));
+        }
 
         if timed_out {
             tracing::warn!(
@@ -423,6 +442,29 @@ mod tests {
             HookOutcome::Success { stdout, .. } => {
                 assert!(!stdout.contains("lr_tok_abcdef"), "stdout: {stdout}");
                 assert!(stdout.contains("***REDACTED***"), "stdout: {stdout}");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn longer_secrets_redact_before_their_prefixes() {
+        // If "abc" were applied before "abcdef", the longer match would
+        // never fire and "def" would leak into the captured output.
+        let (_dir, ws) = workspace();
+        let runner = HookRunner::new(&ws).with_secrets(vec!["abc".into(), "abcdef".into()]);
+        let out = runner
+            .run(&hook("printf %s 'abcdef-and-abc'", 5_000))
+            .unwrap();
+        match out {
+            HookOutcome::Success { stdout, .. } => {
+                assert!(!stdout.contains("abcdef"), "stdout leaks abcdef: {stdout}");
+                assert!(!stdout.contains("def"), "stdout leaks def suffix: {stdout}");
+                // The standalone shorter secret still gets redacted.
+                assert!(
+                    !stdout.contains("abc-"),
+                    "stdout leaks short secret: {stdout}"
+                );
             }
             other => panic!("expected Success, got {other:?}"),
         }
