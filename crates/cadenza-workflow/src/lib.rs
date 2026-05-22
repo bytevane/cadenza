@@ -5,6 +5,11 @@
 //! `Default` impls and `#[serde(default = "…")]` constructors so callers never
 //! plug in defaults at the consumption site.
 
+pub mod source;
+pub use source::{
+    ReloadEvent, ReloadOutcome, WatchError, WorkflowSource, WorkflowSourceError, WorkflowWatcher,
+};
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
