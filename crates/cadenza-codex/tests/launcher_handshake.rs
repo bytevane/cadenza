@@ -130,6 +130,55 @@ async fn rejects_relative_workspace_path() {
 }
 
 #[tokio::test]
+async fn stderr_snapshot_keeps_the_tail_not_the_head_when_cap_exceeded() {
+    // The diagnostic line is emitted LAST, after noisy boot logs. The
+    // ring-buffer behaviour must preserve the tail so operators see the
+    // actual error, not the prelude.
+    const MOCK_NOISE_THEN_FATAL: &str = r#"
+i=0
+while [ $i -lt 200 ]; do
+  printf 'noise log line %04d, padding to fill the cap buffer somewhat\n' "$i" 1>&2
+  i=$((i + 1))
+done
+echo 'FATAL: licence missing' 1>&2
+read -r REQ
+printf '{"jsonrpc":"2.0","id":1,"result":{"userAgent":"mock","codexHome":"/tmp","platformFamily":"unix","platformOs":"macos"}}\n'
+"#;
+    let ws = workspace();
+    let client = AppServerLauncher::new(MOCK_NOISE_THEN_FATAL, ws.path().to_path_buf())
+        .with_startup_timeout(Duration::from_secs(5))
+        // 4 KiB cap forces the prelude to roll out of the ring before the
+        // FATAL line lands.
+        .with_stderr_cap_bytes(4 * 1024)
+        .launch()
+        .await
+        .expect("launch");
+
+    // Poll until the FATAL line is observed (bounded so a regression
+    // can't hang the suite).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let snap = loop {
+        let s = client.stderr_snapshot().await;
+        if s.contains("FATAL: licence missing") {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            panic!("stderr snapshot never captured the trailing FATAL line: {s}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        snap.contains("truncated"),
+        "expected truncation marker: {snap}"
+    );
+    assert!(
+        !snap.contains("noise log line 0000"),
+        "earliest prelude line should have been evicted: {snap}",
+    );
+    client.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn stderr_snapshot_redacts_known_secret() {
     let ws = workspace();
     let client = launcher(MOCK_LEAKS_SECRET, &ws)

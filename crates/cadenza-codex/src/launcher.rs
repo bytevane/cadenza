@@ -191,6 +191,11 @@ impl AppServerLauncher {
                     .await
                     .map_err(LaunchError::Read)?;
                 if read == 0 {
+                    // The child closed stdout, but the stderr task may
+                    // still be draining the last lines that were emitted
+                    // right before exit (the most useful diagnostic).
+                    // Give it a short bounded chance to settle.
+                    settle_stderr(&stderr_buf).await;
                     let tail =
                         redact_text(stderr_buf.lock().await.snapshot_string(), &self.secrets);
                     return Err(LaunchError::EarlyExit { stderr_tail: tail });
@@ -202,6 +207,7 @@ impl AppServerLauncher {
                 let response: JsonRpcResponse =
                     serde_json::from_str(trimmed).map_err(LaunchError::Decode)?;
                 if let Some(err) = response.error {
+                    settle_stderr(&stderr_buf).await;
                     let tail =
                         redact_text(stderr_buf.lock().await.snapshot_string(), &self.secrets);
                     return Err(LaunchError::Protocol {
@@ -223,7 +229,9 @@ impl AppServerLauncher {
             Ok(res) => res,
             Err(_elapsed) => {
                 kill_now(&mut child).await;
+                let _ = child.wait().await;
                 stderr_task.abort();
+                let _ = stderr_task.await;
                 return Err(LaunchError::Timeout(self.startup_timeout));
             }
         };
@@ -232,7 +240,9 @@ impl AppServerLauncher {
             Ok(r) => r,
             Err(e) => {
                 kill_now(&mut child).await;
+                let _ = child.wait().await;
                 stderr_task.abort();
+                let _ = stderr_task.await;
                 return Err(e);
             }
         };
@@ -305,6 +315,26 @@ async fn kill_now(child: &mut Child) {
     let _ = child.start_kill();
 }
 
+/// Wait briefly for the stderr capture task to drain whatever was emitted
+/// right before a child exit. Polls the buffer length up to 200 ms; if two
+/// consecutive samples are equal the buffer has stabilised. This is a
+/// bounded best-effort — the cost is paid only on error paths.
+async fn settle_stderr(buf: &Arc<Mutex<BoundedBuf>>) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    let mut last_len: Option<usize> = None;
+    loop {
+        let len = buf.lock().await.buf.len();
+        if Some(len) == last_len && len > 0 {
+            return;
+        }
+        last_len = Some(len);
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn spawn_stderr_capture(
     stderr: tokio::process::ChildStderr,
     buf: Arc<Mutex<BoundedBuf>>,
@@ -331,10 +361,14 @@ fn redact_text(mut text: String, secrets: &[String]) -> String {
     text
 }
 
+/// Ring buffer that retains the **most recent** `cap` bytes. Codex
+/// failures usually emit the diagnostic line right before exit; keeping
+/// the head would discard exactly that. The implementation drops the
+/// oldest byte for every new byte once the cap is reached.
 #[derive(Debug)]
 struct BoundedBuf {
     cap: usize,
-    buf: Vec<u8>,
+    buf: std::collections::VecDeque<u8>,
     overflowed: bool,
 }
 
@@ -342,27 +376,29 @@ impl BoundedBuf {
     fn new(cap: usize) -> Self {
         Self {
             cap,
-            buf: Vec::with_capacity(cap.min(8 * 1024)),
+            buf: std::collections::VecDeque::with_capacity(cap.min(8 * 1024)),
             overflowed: false,
         }
     }
 
     fn push(&mut self, chunk: &[u8]) {
-        if self.buf.len() >= self.cap {
-            self.overflowed = true;
-            return;
-        }
-        let take = (self.cap - self.buf.len()).min(chunk.len());
-        self.buf.extend_from_slice(&chunk[..take]);
-        if take < chunk.len() {
-            self.overflowed = true;
+        for &b in chunk {
+            if self.buf.len() == self.cap {
+                self.buf.pop_front();
+                self.overflowed = true;
+            }
+            self.buf.push_back(b);
         }
     }
 
     fn snapshot_string(&self) -> String {
-        let mut out = String::from_utf8_lossy(&self.buf).into_owned();
+        let bytes: Vec<u8> = self.buf.iter().copied().collect();
+        let mut out = String::from_utf8_lossy(&bytes).into_owned();
         if self.overflowed {
-            out.push_str("\n<truncated; stderr exceeded capture cap>");
+            out.insert_str(
+                0,
+                "<truncated; stderr exceeded capture cap; keeping tail>\n",
+            );
         }
         out
     }
