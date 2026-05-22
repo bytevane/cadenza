@@ -120,7 +120,14 @@ impl HookRunner {
         let stdout_thread = spawn_reader(stdout, Arc::clone(&stdout_buf));
         let stderr_thread = spawn_reader(stderr, Arc::clone(&stderr_buf));
 
-        let deadline = Instant::now() + Duration::from_millis(hook.timeout_ms);
+        // `Instant + Duration` panics on overflow, so a maliciously large
+        // `timeout_ms` would crash the process. Saturate to a 24h ceiling —
+        // workflow validators already require `timeout_ms > 0`; this guards
+        // the upper edge.
+        let timeout = Duration::from_millis(hook.timeout_ms);
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(24 * 60 * 60));
         let mut timed_out = false;
         loop {
             match child.try_wait() {
@@ -321,6 +328,19 @@ mod tests {
             HookOutcome::Failed { exit, .. } => assert_eq!(exit.code(), Some(7)),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // Boundary: a maliciously large `timeout_ms` must not cause Instant
+    // overflow inside the runner. We do not actually wait that long —
+    // `true` exits immediately, so the loop unrolls on the first
+    // try_wait. The point is that constructing `deadline` with u64::MAX
+    // did not panic.
+    #[test]
+    fn upper_boundary_u64_max_timeout_does_not_panic() {
+        let (_dir, ws) = workspace();
+        let runner = HookRunner::new(&ws);
+        let out = runner.run(&hook("true", u64::MAX)).unwrap();
+        assert!(matches!(out, HookOutcome::Success { .. }), "got {out:?}");
     }
 
     #[test]
