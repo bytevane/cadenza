@@ -245,8 +245,10 @@ struct TokenUsageNotification {
 /// Mirrors `schemas/codex/current/v2/ThreadTokenUsage.ts`:
 /// `{ total: TokenUsageBreakdown, last: TokenUsageBreakdown, modelContextWindow: number | null }`.
 /// `last` and `modelContextWindow` act as structural canaries even though
-/// only `total` is surfaced — a truncated payload missing either should
-/// fail loud per the parser contract.
+/// only `total` is surfaced. `modelContextWindow` uses `serde_json::Value`
+/// (not `Option<u64>`) because serde treats a missing key on `Option<T>`
+/// as `None` — that would silently let a truncated payload through.
+/// With `Value`, the key must be present even when its value is `null`.
 #[derive(Debug, Deserialize)]
 struct ThreadTokenUsage {
     total: TokenUsageBreakdown,
@@ -254,7 +256,7 @@ struct ThreadTokenUsage {
     last: TokenUsageBreakdown,
     #[serde(rename = "modelContextWindow")]
     #[allow(dead_code)]
-    model_context_window: Option<u64>,
+    model_context_window: serde_json::Value,
 }
 
 /// Mirrors `schemas/codex/current/v2/TokenUsageBreakdown.ts`. Only the
@@ -396,6 +398,15 @@ mod tests {
     fn rate_limits_with_missing_envelope_is_typed_error() {
         // Truncated payload — schema requires `rateLimits`.
         let line = r#"{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{}}"#;
+        let err = parse_notification_line(line).unwrap_err();
+        assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn token_usage_with_missing_model_context_window_is_typed_error() {
+        // Schema requires `modelContextWindow` (nullable but the key
+        // must exist). A payload missing the key entirely must fail.
+        let line = r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"t","turnId":"u","tokenUsage":{"total":{"totalTokens":1,"inputTokens":1,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"last":{"totalTokens":1,"inputTokens":1,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0}}}}"#;
         let err = parse_notification_line(line).unwrap_err();
         assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
     }
