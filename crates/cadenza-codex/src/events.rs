@@ -230,9 +230,20 @@ struct ErrorNotification {
     will_retry: bool,
 }
 
+/// Mirrors `schemas/codex/current/v2/TurnError.ts`:
+/// `{ message: string, codexErrorInfo: CodexErrorInfo | null, additionalDetails: string | null }`.
+/// Only `message` is surfaced via `TurnEvent::Error`; `codexErrorInfo`
+/// and `additionalDetails` act as structural canaries so a truncated
+/// error payload fails closed.
 #[derive(Debug, Deserialize)]
 struct ErrorPayload {
     message: String,
+    #[serde(rename = "codexErrorInfo")]
+    #[allow(dead_code)]
+    codex_error_info: serde_json::Value,
+    #[serde(rename = "additionalDetails")]
+    #[allow(dead_code)]
+    additional_details: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,7 +311,7 @@ mod tests {
     /// Replay fixture: a turn that fails with retry recommended.
     const FAILED_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_43"}}}
 {"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}
-{"jsonrpc":"2.0","method":"error","params":{"threadId":"thr_43","turnId":"turn_2","error":{"message":"upstream timeout"},"willRetry":true}}"#;
+{"jsonrpc":"2.0","method":"error","params":{"threadId":"thr_43","turnId":"turn_2","error":{"message":"upstream timeout","codexErrorInfo":null,"additionalDetails":null},"willRetry":true}}"#;
 
     /// Replay fixture: a successful turn that also includes a rate-limit
     /// observation and one unknown method that must pass through as Other.
