@@ -5,9 +5,11 @@
 //! mirrors the relevant schema-generated types under
 //! `schemas/codex/current/`.
 
+pub mod events;
 pub mod launcher;
 pub mod protocol;
 
+pub use events::{EventStreamError, TurnEvent, parse_notification_line};
 pub use launcher::{AppServerClient, AppServerLauncher, DEFAULT_STDERR_CAP_BYTES, LaunchError};
 pub use protocol::{
     ClientInfo, InitializeCapabilities, InitializeParams, InitializeResponse, JsonRpcError,
