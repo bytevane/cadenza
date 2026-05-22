@@ -177,13 +177,13 @@ struct TurnStartedOrCompleted {
 }
 
 /// Schema-required Turn fields that Cadenza validates. The full `Turn`
-/// struct in `schemas/codex/current/v2/Turn.ts` has more fields the
-/// orchestrator does not consume (error, startedAt, completedAt — the
-/// latter two are explicitly nullable in the schema). The required-by-
-/// schema, non-nullable fields are `id`, `status`, `items`, `itemsView`
-/// — all four are required here as a structural canary so a truncated
-/// payload fails closed, per
-/// `docs/specs/13-codex-turn-lifecycle.md`.
+/// struct in `schemas/codex/current/v2/Turn.ts` is
+/// `{ id, items, itemsView, status, error, startedAt, completedAt, ... }`.
+/// The orchestrator only consumes `id`, but every schema-required field
+/// is declared here (even when nullable) so a truncated payload — missing
+/// a required key — fails closed with `EventStreamError::Json`. Nullable
+/// fields use `serde_json::Value` (without `#[serde(default)]`) so the
+/// key must be present even when its value is `null`.
 #[derive(Debug, Deserialize)]
 struct TurnView {
     id: String,
@@ -194,6 +194,15 @@ struct TurnView {
     #[serde(rename = "itemsView")]
     #[allow(dead_code)]
     items_view: serde_json::Value,
+    // Nullable per schema, but the key must exist.
+    #[allow(dead_code)]
+    error: serde_json::Value,
+    #[serde(rename = "startedAt")]
+    #[allow(dead_code)]
+    started_at: serde_json::Value,
+    #[serde(rename = "completedAt")]
+    #[allow(dead_code)]
+    completed_at: serde_json::Value,
 }
 
 /// Structural canary for `account/rateLimits/updated`. The schema is
@@ -234,10 +243,18 @@ struct TokenUsageNotification {
 }
 
 /// Mirrors `schemas/codex/current/v2/ThreadTokenUsage.ts`:
-/// `{ total: TokenUsageBreakdown, last: TokenUsageBreakdown, modelContextWindow }`.
+/// `{ total: TokenUsageBreakdown, last: TokenUsageBreakdown, modelContextWindow: number | null }`.
+/// `last` and `modelContextWindow` act as structural canaries even though
+/// only `total` is surfaced — a truncated payload missing either should
+/// fail loud per the parser contract.
 #[derive(Debug, Deserialize)]
 struct ThreadTokenUsage {
     total: TokenUsageBreakdown,
+    #[allow(dead_code)]
+    last: TokenUsageBreakdown,
+    #[serde(rename = "modelContextWindow")]
+    #[allow(dead_code)]
+    model_context_window: Option<u64>,
 }
 
 /// Mirrors `schemas/codex/current/v2/TokenUsageBreakdown.ts`. Only the
@@ -269,15 +286,15 @@ mod tests {
     /// required by `TurnView`; `tokenUsage` carries the nested
     /// `total`/`last` breakdowns.
     const SUCCESSFUL_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_42"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"running","items":[],"itemsView":{}}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null}}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"Hello "}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"world"}}
 {"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thr_42","turnId":"turn_1","tokenUsage":{"total":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"last":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"modelContextWindow":128000}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"completed","items":[],"itemsView":{}}}}"#;
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"completed","items":[],"itemsView":{},"error":null,"startedAt":1,"completedAt":2}}}"#;
 
     /// Replay fixture: a turn that fails with retry recommended.
     const FAILED_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_43"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running","items":[],"itemsView":{}}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null}}}
 {"jsonrpc":"2.0","method":"error","params":{"threadId":"thr_43","turnId":"turn_2","error":{"message":"upstream timeout"},"willRetry":true}}"#;
 
     /// Replay fixture: a successful turn that also includes a rate-limit
@@ -285,8 +302,8 @@ mod tests {
     const SUCCESSFUL_TURN_WITH_RATE_LIMITS_AND_UNKNOWN: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_44"}}}
 {"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"rpm","limitName":"per_minute","primary":null,"secondary":null,"credits":null,"planType":null,"rateLimitReachedType":null}}}
 {"jsonrpc":"2.0","method":"future/unknown/event","params":{"opaque":true}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"running","items":[],"itemsView":{}}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"completed","items":[],"itemsView":{}}}}"#;
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"running","items":[],"itemsView":{},"error":null,"startedAt":null,"completedAt":null}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"completed","items":[],"itemsView":{},"error":null,"startedAt":1,"completedAt":2}}}"#;
 
     fn parse_stream(s: &str) -> Vec<TurnEvent> {
         s.lines()
@@ -379,6 +396,24 @@ mod tests {
     fn rate_limits_with_missing_envelope_is_typed_error() {
         // Truncated payload — schema requires `rateLimits`.
         let line = r#"{"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{}}"#;
+        let err = parse_notification_line(line).unwrap_err();
+        assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn token_usage_with_missing_last_breakdown_is_typed_error() {
+        // The v2 schema requires both `total` and `last`; this fixture
+        // provides only `total`. Must fail loud.
+        let line = r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"t","turnId":"u","tokenUsage":{"total":{"totalTokens":1,"inputTokens":1,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"modelContextWindow":null}}}"#;
+        let err = parse_notification_line(line).unwrap_err();
+        assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn turn_started_missing_nullable_required_key_is_typed_error() {
+        // Schema requires `error` to be present (can be null). A turn
+        // payload missing the key entirely is truncated.
+        let line = r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t","turn":{"id":"u","status":"running","items":[],"itemsView":{},"startedAt":null,"completedAt":null}}}"#;
         let err = parse_notification_line(line).unwrap_err();
         assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
     }
