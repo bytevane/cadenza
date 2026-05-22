@@ -134,8 +134,6 @@ impl HookRunner {
                 Ok(Some(_status)) => break,
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        kill_process_group(&mut child);
-                        let _ = child.wait();
                         timed_out = true;
                         break;
                     }
@@ -144,6 +142,14 @@ impl HookRunner {
                 Err(e) => return Err(HookLaunchError::Spawn(e)),
             }
         }
+
+        // Always SIGKILL the whole process group, even on success. A hook
+        // like `sleep 300 &` lets sh exit immediately but leaves an
+        // orphaned background grandchild holding the stdio pipes; without
+        // this kill, joining the reader threads would block until that
+        // grandchild died on its own.
+        kill_process_group(&mut child);
+        let _ = child.wait();
 
         let _ = stdout_thread.join();
         let _ = stderr_thread.join();
@@ -328,6 +334,25 @@ mod tests {
             HookOutcome::Failed { exit, .. } => assert_eq!(exit.code(), Some(7)),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_grandchild_does_not_block_reader_join() {
+        // `sleep 300 &` lets sh exit immediately but spawns a
+        // background grandchild that inherits the stdio pipes. Without
+        // a post-exit process-group kill, joining the reader threads
+        // would block until sleep dies on its own (300s).
+        let (_dir, ws) = workspace();
+        let runner = HookRunner::new(&ws);
+        let start = Instant::now();
+        let out = runner.run(&hook("sleep 300 &", 5_000)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(matches!(out, HookOutcome::Success { .. }), "got {out:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected return under 2s, took {elapsed:?}",
+        );
     }
 
     // Boundary: a maliciously large `timeout_ms` must not cause Instant
