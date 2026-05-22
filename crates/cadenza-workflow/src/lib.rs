@@ -234,6 +234,15 @@ fn validate(c: &WorkflowConfig) -> Result<(), WorkflowError> {
         }
         require_positive_u64("hooks.after_create.timeout_ms", hook.timeout_ms)?;
     }
+    if !c.prompt.strict_undefined {
+        // The renderer in this crate hard-codes `UndefinedBehavior::Strict`.
+        // Accepting `strict_undefined: false` would silently ignore the
+        // operator's intent — reject until #8 wires it through.
+        return Err(WorkflowError::invalid(
+            "prompt.strict_undefined",
+            "non-strict prompt rendering is not implemented yet (see issue #8)",
+        ));
+    }
     Ok(())
 }
 
@@ -548,6 +557,30 @@ prompt body
         let w = parse_workflow(&body).unwrap();
         let hook = w.config.hooks.after_create.as_ref().unwrap();
         assert_eq!(hook.timeout_ms, 1);
+    }
+
+    #[test]
+    fn prompt_strict_undefined_false_is_rejected() {
+        let body = MINIMAL_FRONT_MATTER
+            .trim_end_matches("---\nprompt body\n")
+            .to_string()
+            + "prompt:\n  strict_undefined: false\n---\nprompt body\n";
+        let err = parse_workflow(&body).unwrap_err();
+        let WorkflowError::Invalid { field, message } = err else {
+            panic!("unexpected: {err:?}");
+        };
+        assert_eq!(field, "prompt.strict_undefined");
+        assert!(message.contains("not implemented"));
+    }
+
+    #[test]
+    fn prompt_strict_undefined_true_is_accepted_explicitly() {
+        let body = MINIMAL_FRONT_MATTER
+            .trim_end_matches("---\nprompt body\n")
+            .to_string()
+            + "prompt:\n  strict_undefined: true\n---\nprompt body\n";
+        let w = parse_workflow(&body).unwrap();
+        assert!(w.config.prompt.strict_undefined);
     }
 
     #[test]
