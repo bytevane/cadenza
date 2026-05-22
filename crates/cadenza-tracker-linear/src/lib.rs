@@ -112,7 +112,12 @@ impl<T: LinearTransport> LinearClient<T> {
             }
             cursor = info.end_cursor;
             if cursor.is_none() {
-                break;
+                // hasNextPage said there is more, but the server did not give us
+                // a cursor to ask for it. Silently breaking would truncate the
+                // candidate set; surface the malformed response loudly.
+                return Err(TrackerError::InvalidResponse(
+                    "pageInfo.hasNextPage=true but endCursor was missing; refusing to silently truncate".into(),
+                ));
             }
         }
         Ok(out)
@@ -134,7 +139,14 @@ impl<T: LinearTransport + 'static> IssueTrackerClient for LinearClient<T> {
     }
 
     async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError> {
+        // Scope to the configured project so workspaces with multiple
+        // projects sharing state names cannot mix foreign issues into
+        // the orchestrator's view.
+        let project = self.config.project_slug_id.clone().ok_or_else(|| {
+            TrackerError::Upstream("workflow tracker.project_slug_id required".into())
+        })?;
         let base = serde_json::json!({
+            "projectId": project,
             "states": states,
             "first": self.config.page_size,
         });
@@ -146,14 +158,37 @@ impl<T: LinearTransport + 'static> IssueTrackerClient for LinearClient<T> {
         &self,
         ids: &[String],
     ) -> Result<Vec<(String, String)>, TrackerError> {
-        let payload = self
-            .transport
-            .execute(
-                queries::ISSUE_STATES_BY_IDS,
-                serde_json::json!({ "ids": ids }),
-            )
-            .await?;
-        extract_state_pairs(payload)
+        // Linear's connection default page size (50) would silently
+        // truncate large id sets. Paginate explicitly using the same
+        // `first`/`after`/`pageInfo` pattern the issue-fetch queries use.
+        let mut out = Vec::with_capacity(ids.len());
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut vars = serde_json::json!({
+                "ids": ids,
+                "first": self.config.page_size,
+            });
+            if let Some(c) = &cursor {
+                vars["after"] = serde_json::Value::String(c.clone());
+            }
+            let payload = self
+                .transport
+                .execute(queries::ISSUE_STATES_BY_IDS, vars)
+                .await?;
+            let (pairs, info) = extract_state_pairs_page(payload)?;
+            out.extend(pairs);
+            if !info.has_next_page {
+                break;
+            }
+            cursor = info.end_cursor;
+            if cursor.is_none() {
+                return Err(TrackerError::InvalidResponse(
+                    "pageInfo.hasNextPage=true but endCursor was missing on issue-states lookup"
+                        .into(),
+                ));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -242,13 +277,22 @@ fn extract_issues_page(payload: serde_json::Value) -> Result<(Vec<Issue>, PageIn
     Ok((issues, envelope.page_info))
 }
 
-fn extract_state_pairs(payload: serde_json::Value) -> Result<Vec<(String, String)>, TrackerError> {
+fn extract_state_pairs_page(
+    payload: serde_json::Value,
+) -> Result<(Vec<(String, String)>, PageInfo), TrackerError> {
     let arr = payload
         .pointer("/issues/nodes")
         .ok_or_else(|| TrackerError::InvalidResponse("missing data.issues.nodes".into()))?
         .as_array()
         .ok_or_else(|| TrackerError::InvalidResponse("data.issues.nodes is not an array".into()))?
         .clone();
+    let info: PageInfo = serde_json::from_value(
+        payload
+            .pointer("/issues/pageInfo")
+            .cloned()
+            .ok_or_else(|| TrackerError::InvalidResponse("missing data.issues.pageInfo".into()))?,
+    )
+    .map_err(|e| TrackerError::InvalidResponse(format!("pageInfo parse: {e}")))?;
     let mut out = Vec::with_capacity(arr.len());
     for node in arr {
         let id = node
@@ -263,7 +307,7 @@ fn extract_state_pairs(payload: serde_json::Value) -> Result<Vec<(String, String
             .to_string();
         out.push((id, state));
     }
-    Ok(out)
+    Ok((out, info))
 }
 
 fn normalize(node: IssueNode) -> Issue {
@@ -499,7 +543,8 @@ mod tests {
                 "nodes": [
                     { "id": "a", "state": { "name": "in progress" } },
                     { "id": "b", "state": { "name": "done" } }
-                ]
+                ],
+                "pageInfo": { "hasNextPage": false, "endCursor": null }
             }
         });
         let transport = MockTransport::new(vec![Ok(payload)]);
@@ -514,6 +559,69 @@ mod tests {
                 ("a".into(), "in progress".into()),
                 ("b".into(), "done".into())
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_issue_states_by_ids_paginates_when_id_set_is_large() {
+        let page1 = serde_json::json!({
+            "issues": {
+                "nodes": [{ "id": "a", "state": { "name": "todo" } }],
+                "pageInfo": { "hasNextPage": true, "endCursor": "c1" }
+            }
+        });
+        let page2 = serde_json::json!({
+            "issues": {
+                "nodes": [{ "id": "b", "state": { "name": "done" } }],
+                "pageInfo": { "hasNextPage": false, "endCursor": null }
+            }
+        });
+        let transport_arc = Arc::new(MockTransport::new(vec![Ok(page1), Ok(page2)]));
+        let client = LinearClient {
+            config: cfg(),
+            transport: transport_arc.clone(),
+        };
+        let pairs = client
+            .fetch_issue_states_by_ids(&["a".into(), "b".into()])
+            .await
+            .unwrap();
+        assert_eq!(pairs.len(), 2);
+        let calls = transport_arc.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1.get("after").is_none());
+        assert_eq!(calls[1].1.get("after").and_then(|v| v.as_str()), Some("c1"),);
+    }
+
+    #[tokio::test]
+    async fn paginate_with_has_next_page_but_no_cursor_is_typed_error() {
+        let payload = serde_json::json!({
+            "issues": {
+                "nodes": [],
+                "pageInfo": { "hasNextPage": true, "endCursor": null }
+            }
+        });
+        let transport = MockTransport::new(vec![Ok(payload)]);
+        let client = LinearClient::new(cfg(), transport);
+        let err = client.fetch_candidate_issues().await.unwrap_err();
+        assert!(
+            matches!(err, TrackerError::InvalidResponse(ref m) if m.contains("endCursor")),
+            "got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_issues_by_states_requires_project_slug() {
+        let transport = MockTransport::new(vec![]);
+        let mut config = cfg();
+        config.project_slug_id = None;
+        let client = LinearClient::new(config, transport);
+        let err = client
+            .fetch_issues_by_states(&["todo".into()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TrackerError::Upstream(ref m) if m.contains("project_slug_id")),
+            "got {err:?}",
         );
     }
 

@@ -36,11 +36,22 @@ query CandidateIssues($projectId: String!, $first: Int!, $after: String) {
 }
 "#;
 
-/// All issues whose `state.name` is in the provided set.
+/// Issues in the configured project whose `state.name` is in the
+/// provided set. The project filter is mandatory — otherwise a
+/// workspace with multiple projects sharing state names would mix
+/// foreign issues into the orchestrator's view.
 pub const ISSUES_BY_STATES: &str = r#"
-query IssuesByStates($states: [String!]!, $first: Int!, $after: String) {
+query IssuesByStates(
+  $projectId: String!
+  $states: [String!]!
+  $first: Int!
+  $after: String
+) {
   issues(
-    filter: { state: { name: { in: $states } } }
+    filter: {
+      project: { id: { eq: $projectId } }
+      state: { name: { in: $states } }
+    }
     first: $first
     after: $after
     orderBy: updatedAt
@@ -68,14 +79,17 @@ query IssuesByStates($states: [String!]!, $first: Int!, $after: String) {
 }
 "#;
 
-/// Lookup the current state name for each issue id.
+/// Lookup the current state name for each issue id. Paginated so id
+/// sets larger than Linear's default connection page size do not get
+/// silently truncated.
 pub const ISSUE_STATES_BY_IDS: &str = r#"
-query IssueStatesByIds($ids: [String!]!) {
-  issues(filter: { id: { in: $ids } }) {
+query IssueStatesByIds($ids: [String!]!, $first: Int!, $after: String) {
+  issues(filter: { id: { in: $ids } }, first: $first, after: $after) {
     nodes {
       id
       state { name }
     }
+    pageInfo { hasNextPage endCursor }
   }
 }
 "#;
