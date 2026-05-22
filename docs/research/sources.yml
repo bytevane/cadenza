@@ -1,0 +1,74 @@
+checked_on: 2026-05-22
+sources:
+  - name: Symphony SPEC
+    url: https://github.com/openai/symphony/blob/main/SPEC.md
+    category: symphony
+    purpose: Authoritative implementation specification.
+  - name: OpenAI Symphony article
+    url: https://openai.com/index/open-source-codex-orchestration-symphony/
+    category: symphony
+    purpose: Product/design intent for issue tracker as control plane.
+  - name: Codex app-server docs
+    url: https://developers.openai.com/codex/app-server
+    category: codex
+    purpose: App-server transport, JSON-RPC, schema generation, experimental status.
+  - name: Codex CLI reference
+    url: https://developers.openai.com/codex/cli/reference
+    category: codex
+    purpose: CLI flags, app-server command, exec command, auth commands.
+  - name: Rust wasm32-wasip2 target
+    url: https://doc.rust-lang.org/rustc/platform-support/wasm32-wasip2.html
+    category: rust-wasm
+    purpose: Rust component target requirements.
+  - name: WASI
+    url: https://wasi.dev/
+    category: rust-wasm
+    purpose: WASI security standard interface framing.
+  - name: Component Model guide
+    url: https://component-model.bytecodealliance.org/
+    category: component-model
+    purpose: Component model architecture.
+  - name: WIT design
+    url: https://component-model.bytecodealliance.org/design/wit.html
+    category: component-model
+    purpose: Interface/world/package language design.
+  - name: Wasmtime security
+    url: https://docs.wasmtime.dev/security.html
+    category: wasmtime
+    purpose: Sandbox threat model.
+  - name: Wasmtime ResourceLimiter
+    url: https://docs.wasmtime.dev/api/wasmtime/trait.ResourceLimiter.html
+    category: wasmtime
+    purpose: Store resource limits.
+  - name: wasm-tools
+    url: https://github.com/bytecodealliance/wasm-tools
+    category: tooling
+    purpose: validate and component WIT extraction.
+  - name: wit-bindgen
+    url: https://github.com/bytecodealliance/wit-bindgen
+    category: tooling
+    purpose: Guest bindings generation.
+  - name: cargo-component
+    url: https://github.com/bytecodealliance/cargo-component
+    category: tooling
+    purpose: Optional/experimental component workflow reference.
+  - name: IronClaw
+    url: https://github.com/nearai/ironclaw
+    category: reference-implementation
+    purpose: Wasm sandbox, capability-based tool and host-mediated credentials reference.
+  - name: IronClaw WIT mismatch issue
+    url: https://github.com/nearai/ironclaw/issues/840
+    category: reference-implementation
+    purpose: Evidence of WIT version mismatch risk.
+  - name: Claude Code CLI reference
+    url: https://docs.anthropic.com/en/docs/claude-code/cli-reference
+    category: ai-collaboration
+    purpose: Non-interactive Claude Code usage and structured output.
+  - name: Claude Code SDK
+    url: https://docs.anthropic.com/en/docs/claude-code/sdk
+    category: ai-collaboration
+    purpose: Programmatic Claude Code usage.
+  - name: GitHub Actions secure use
+    url: https://docs.github.com/en/actions/reference/security/secure-use
+    category: ci-security
+    purpose: OIDC, least privilege and secret hygiene.
