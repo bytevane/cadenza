@@ -83,7 +83,7 @@ pub fn redact_snapshot(snapshot: &mut RuntimeSnapshot) {
 /// `authorization: bearer XXX` puts the secret two tokens past the
 /// separator) so we conservatively leave them. Structured fields that
 /// carry a key/value pair separately should use `redact_value` instead.
-fn scrub_text(text: &str) -> String {
+pub(crate) fn scrub_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {

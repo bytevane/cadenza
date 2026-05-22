@@ -12,10 +12,12 @@
 //! state API.
 
 pub mod fields;
+pub mod scrubber;
 pub mod server;
 pub mod snapshot;
 
 pub use fields::*;
+pub use scrubber::Scrubber;
 pub use server::{ObsAppState, SnapshotProvider, default_bind, router};
 pub use snapshot::{
     IssueRunningView, LastReloadView, RetryView, RuntimeSnapshot, SkipReasonView, redact_snapshot,
@@ -32,13 +34,20 @@ pub fn redact_value(key: &str, value: &str) -> String {
     }
 }
 
-/// Internal helper — case-insensitive secret-key check.
-pub(crate) fn looks_secret(key: &str) -> bool {
+/// Case-insensitive secret-key detection. Exposed so downstream
+/// crates (cadenza-workspace hook runner, cadenza-codex stderr
+/// capture) can share the same predicate instead of growing
+/// independent allow-lists.
+///
+/// Covers the issue #21 set: `*_TOKEN`, `*_KEY`, `secret`,
+/// `password`, `authorization`, `cookie`.
+pub fn looks_secret(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key.contains("token")
         || key.contains("secret")
         || key.contains("password")
         || key.contains("authorization")
+        || key.contains("cookie")
         || key.ends_with("_key")
 }
 
