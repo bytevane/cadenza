@@ -4,6 +4,10 @@ sources:
     url: https://github.com/openai/symphony/blob/main/SPEC.md
     category: symphony
     purpose: Authoritative implementation specification.
+  - name: Symphony repo
+    url: https://github.com/openai/symphony
+    category: symphony
+    purpose: Upstream repo state, README, prototype implementation notes.
   - name: OpenAI Symphony article
     url: https://openai.com/index/open-source-codex-orchestration-symphony/
     category: symphony
@@ -16,6 +20,10 @@ sources:
     url: https://developers.openai.com/codex/cli/reference
     category: codex
     purpose: CLI flags, app-server command, exec command, auth commands.
+  - name: OpenAI Codex repo
+    url: https://github.com/openai/codex
+    category: codex
+    purpose: App-server implementation, README, issues, schema drift reference.
   - name: Rust wasm32-wasip2 target
     url: https://doc.rust-lang.org/rustc/platform-support/wasm32-wasip2.html
     category: rust-wasm
@@ -32,14 +40,42 @@ sources:
     url: https://component-model.bytecodealliance.org/design/wit.html
     category: component-model
     purpose: Interface/world/package language design.
+  - name: Component worlds
+    url: https://component-model.bytecodealliance.org/design/worlds.html
+    category: component-model
+    purpose: World organization patterns.
+  - name: Component packages
+    url: https://component-model.bytecodealliance.org/design/packages.html
+    category: component-model
+    purpose: Package versioning conventions.
+  - name: Rust component guide
+    url: https://component-model.bytecodealliance.org/language-support/building-a-simple-component/rust.html
+    category: component-model
+    purpose: Native Rust wasm32-wasip2 component build reference.
+  - name: Wasmtime docs
+    url: https://docs.wasmtime.dev/
+    category: wasmtime
+    purpose: Runtime, examples, security overview.
   - name: Wasmtime security
     url: https://docs.wasmtime.dev/security.html
     category: wasmtime
     purpose: Sandbox threat model.
+  - name: Wasmtime component API
+    url: https://docs.wasmtime.dev/api/wasmtime/component/index.html
+    category: wasmtime
+    purpose: Rust host component API.
+  - name: Wasmtime WASI API
+    url: https://docs.wasmtime.dev/api/wasmtime_wasi/index.html
+    category: wasmtime
+    purpose: WASI integration on the host side.
   - name: Wasmtime ResourceLimiter
     url: https://docs.wasmtime.dev/api/wasmtime/trait.ResourceLimiter.html
     category: wasmtime
     purpose: Store resource limits.
+  - name: Wasmtime Config (epoch/fuel)
+    url: https://docs.wasmtime.dev/api/wasmtime/struct.Config.html
+    category: wasmtime
+    purpose: CPU interruption, fuel, and epoch configuration reference.
   - name: wasm-tools
     url: https://github.com/bytecodealliance/wasm-tools
     category: tooling
@@ -56,10 +92,22 @@ sources:
     url: https://github.com/nearai/ironclaw
     category: reference-implementation
     purpose: Wasm sandbox, capability-based tool and host-mediated credentials reference.
+  - name: IronClaw WIT / host functions
+    url: https://github.com/nearai/ironclaw/blob/staging/wit/tool.wit
+    category: reference-implementation
+    purpose: log, workspace-read, http-request, tool-invoke, secret-exists capability inspiration.
   - name: IronClaw WIT mismatch issue
     url: https://github.com/nearai/ironclaw/issues/840
     category: reference-implementation
     purpose: Evidence of WIT version mismatch risk.
+  - name: IronClaw host function issue
+    url: https://github.com/nearai/ironclaw/issues/1741
+    category: reference-implementation
+    purpose: Host functions list reference.
+  - name: Claude Code overview
+    url: https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview
+    category: ai-collaboration
+    purpose: Claude Code positioning.
   - name: Claude Code CLI reference
     url: https://docs.anthropic.com/en/docs/claude-code/cli-reference
     category: ai-collaboration
@@ -68,7 +116,31 @@ sources:
     url: https://docs.anthropic.com/en/docs/claude-code/sdk
     category: ai-collaboration
     purpose: Programmatic Claude Code usage.
+  - name: Claude Code TypeScript SDK
+    url: https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-typescript
+    category: ai-collaboration
+    purpose: Remote/containerized execution capability reference.
+  - name: Claude Code IAM
+    url: https://docs.anthropic.com/en/docs/claude-code/iam
+    category: ai-collaboration
+    purpose: setup-token, CI/headless auth flows.
+  - name: Claude Code hooks
+    url: https://docs.anthropic.com/en/docs/claude-code/hooks
+    category: ai-collaboration
+    purpose: Development-time hook governance reference.
+  - name: GitHub Actions secrets
+    url: https://docs.github.com/actions/security-guides/using-secrets-in-github-actions
+    category: ci-security
+    purpose: Secret scopes and usage guidance.
   - name: GitHub Actions secure use
     url: https://docs.github.com/en/actions/reference/security/secure-use
     category: ci-security
     purpose: OIDC, least privilege and secret hygiene.
+  - name: GitHub Actions contexts reference
+    url: https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
+    category: ci-security
+    purpose: Avoid logging sensitive contexts.
+  - name: GitHub Actions workflow commands
+    url: https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands
+    category: ci-security
+    purpose: Masking and log hygiene.
