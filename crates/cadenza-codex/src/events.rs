@@ -114,11 +114,15 @@ pub fn parse_notification_line(line: &str) -> Result<TurnEvent, EventStreamError
         }
         Some("thread/tokenUsage/updated") => {
             let parsed: TokenUsageNotification = serde_json::from_value(params.clone())?;
+            // `tokenUsage` is nested per the v2 schema:
+            // `{ total: TokenUsageBreakdown, last: TokenUsageBreakdown, … }`
+            // We report `total` so the orchestrator sees the cumulative
+            // counters; `last` would only describe the latest delta.
             TurnEvent::TokenUsage {
                 thread_id: parsed.thread_id,
                 turn_id: parsed.turn_id,
-                input_tokens: parsed.token_usage.input_tokens.unwrap_or(0),
-                output_tokens: parsed.token_usage.output_tokens.unwrap_or(0),
+                input_tokens: parsed.token_usage.total.input_tokens,
+                output_tokens: parsed.token_usage.total.output_tokens,
             }
         }
         Some("item/agentMessage/delta") => {
@@ -165,9 +169,16 @@ struct TurnStartedOrCompleted {
     turn: TurnView,
 }
 
+/// Schema-required Turn fields that Cadenza extracts. The full `Turn`
+/// struct in `schemas/codex/current/v2/Turn.ts` has many more fields
+/// (items, itemsView, error, …) which we deliberately ignore — but the
+/// status must be present so we fail closed on a truncated payload,
+/// per the contract documented in `docs/specs/13-codex-turn-lifecycle.md`.
 #[derive(Debug, Deserialize)]
 struct TurnView {
     id: String,
+    #[allow(dead_code)]
+    status: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,15 +204,25 @@ struct TokenUsageNotification {
     #[serde(rename = "turnId")]
     turn_id: String,
     #[serde(rename = "tokenUsage")]
-    token_usage: TokenUsage,
+    token_usage: ThreadTokenUsage,
 }
 
+/// Mirrors `schemas/codex/current/v2/ThreadTokenUsage.ts`:
+/// `{ total: TokenUsageBreakdown, last: TokenUsageBreakdown, modelContextWindow }`.
 #[derive(Debug, Deserialize)]
-struct TokenUsage {
-    #[serde(default, rename = "inputTokens")]
-    input_tokens: Option<u64>,
-    #[serde(default, rename = "outputTokens")]
-    output_tokens: Option<u64>,
+struct ThreadTokenUsage {
+    total: TokenUsageBreakdown,
+}
+
+/// Mirrors `schemas/codex/current/v2/TokenUsageBreakdown.ts`. Only the
+/// fields Cadenza decisions consume are extracted; the rest are ignored
+/// but tolerated.
+#[derive(Debug, Deserialize)]
+struct TokenUsageBreakdown {
+    #[serde(rename = "inputTokens")]
+    input_tokens: u64,
+    #[serde(rename = "outputTokens")]
+    output_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,17 +239,19 @@ mod tests {
     use super::*;
 
     /// Replay fixture: a successful turn from start to completion. Each
-    /// JSONL line is what the server would have emitted in order.
+    /// JSONL line mirrors the v2 schema — `turn.{id,status}` are both
+    /// required by `TurnView`; `tokenUsage` carries the nested
+    /// `total`/`last` breakdowns.
     const SUCCESSFUL_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_42"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1"}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"running"}}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"Hello "}}
 {"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thr_42","turnId":"turn_1","delta":"world"}}
-{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thr_42","turnId":"turn_1","tokenUsage":{"inputTokens":42,"outputTokens":7}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1"}}}"#;
+{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"thr_42","turnId":"turn_1","tokenUsage":{"total":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"last":{"totalTokens":49,"inputTokens":42,"cachedInputTokens":0,"outputTokens":7,"reasoningOutputTokens":0},"modelContextWindow":128000}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_42","turn":{"id":"turn_1","status":"completed"}}}"#;
 
     /// Replay fixture: a turn that fails with retry recommended.
     const FAILED_TURN_JSONL: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_43"}}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2"}}}
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_43","turn":{"id":"turn_2","status":"running"}}}
 {"jsonrpc":"2.0","method":"error","params":{"threadId":"thr_43","turnId":"turn_2","error":{"message":"upstream timeout"},"willRetry":true}}"#;
 
     /// Replay fixture: a successful turn that also includes a rate-limit
@@ -236,8 +259,8 @@ mod tests {
     const SUCCESSFUL_TURN_WITH_RATE_LIMITS_AND_UNKNOWN: &str = r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thr_44"}}}
 {"jsonrpc":"2.0","method":"account/rateLimits/updated","params":{"buckets":[{"name":"per_minute","remaining":100}]}}
 {"jsonrpc":"2.0","method":"future/unknown/event","params":{"opaque":true}}
-{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3"}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3"}}}"#;
+{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"running"}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thr_44","turn":{"id":"turn_3","status":"completed"}}}"#;
 
     fn parse_stream(s: &str) -> Vec<TurnEvent> {
         s.lines()
@@ -339,18 +362,47 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_with_missing_fields_defaults_to_zero() {
+    fn token_usage_with_missing_nested_breakdown_is_typed_error() {
+        // Per the v2 schema `tokenUsage.total.{inputTokens,outputTokens}`
+        // are required. Sending `{tokenUsage: {}}` is a truncated payload
+        // and must fail loud, not silently report zeros.
         let line = r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"t","turnId":"u","tokenUsage":{}}}"#;
+        let err = parse_notification_line(line).unwrap_err();
+        assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn token_usage_extracts_total_breakdown_not_last() {
+        // Boundary: `total` and `last` carry different counters. The
+        // parser must surface the cumulative `total.*`, not the most-
+        // recent-delta `last.*`.
+        let line = r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"t","turnId":"u","tokenUsage":{"total":{"totalTokens":150,"inputTokens":100,"cachedInputTokens":0,"outputTokens":50,"reasoningOutputTokens":0},"last":{"totalTokens":30,"inputTokens":20,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"modelContextWindow":128000}}}"#;
         match parse_notification_line(line).unwrap() {
             TurnEvent::TokenUsage {
                 input_tokens,
                 output_tokens,
                 ..
             } => {
-                assert_eq!(input_tokens, 0);
-                assert_eq!(output_tokens, 0);
+                assert_eq!(
+                    input_tokens, 100,
+                    "expected total.inputTokens (100), not last.inputTokens",
+                );
+                assert_eq!(
+                    output_tokens, 50,
+                    "expected total.outputTokens (50), not last.outputTokens",
+                );
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn turn_started_with_missing_status_is_typed_error() {
+        // Truncated `turn` object (only `id`, no required `status`) must
+        // fail loud per the documented "known method, unexpected shape ->
+        // typed JSON error" rule.
+        let line = r#"{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"t","turn":{"id":"u"}}}"#;
+        let err = parse_notification_line(line).unwrap_err();
+        assert!(matches!(err, EventStreamError::Json(_)), "got {err:?}");
     }
 }
