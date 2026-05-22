@@ -145,60 +145,60 @@ impl WorkflowSource {
     /// definition on success. On any failure the existing
     /// `current()` is preserved (last-known-good) and a `Rejected`
     /// event is recorded so the operator can see what happened.
+    ///
+    /// All state mutation (version bump, Arc swap, last_event, history)
+    /// happens inside a single write-lock critical section so concurrent
+    /// callers cannot publish stale metadata (e.g. last_event reverting
+    /// to an older version after a newer reload already completed).
     pub fn try_reload(&self) -> ReloadOutcome {
-        let outcome = match self.read_and_parse() {
-            Ok(definition) => self.commit_new(definition),
-            Err(err) => ReloadOutcome::Rejected {
-                reason: err.to_string(),
-            },
+        let parsed = fs::read_to_string(&self.path)
+            .map_err(|e| WorkflowSourceError::Io {
+                path: self.path.clone(),
+                source: e,
+            })
+            .and_then(|s| parse_workflow(&s).map_err(WorkflowSourceError::from));
+
+        let outcome = {
+            let mut state = self.state.write().expect("source state lock poisoned");
+            let outcome = match parsed {
+                Ok(definition) => {
+                    state.version = state.version.saturating_add(1);
+                    state.current = Arc::new(definition);
+                    ReloadOutcome::Loaded {
+                        version: state.version,
+                    }
+                }
+                Err(err) => ReloadOutcome::Rejected {
+                    reason: err.to_string(),
+                },
+            };
+            let event = ReloadEvent {
+                at: SystemTime::now(),
+                outcome: outcome.clone(),
+            };
+            state.last_event = event.clone();
+            if state.history.len() == HISTORY_CAPACITY {
+                state.history.pop_front();
+            }
+            state.history.push_back(event);
+            outcome
         };
-        self.record(outcome.clone());
-        if let ReloadOutcome::Rejected { reason } = &outcome {
-            tracing::warn!(
+
+        match &outcome {
+            ReloadOutcome::Rejected { reason } => tracing::warn!(
                 target: "cadenza.workflow.reload",
                 path = %self.path.display(),
                 error = reason.as_str(),
                 "workflow reload rejected, keeping last-known-good",
-            );
-        } else if let ReloadOutcome::Loaded { version } = &outcome {
-            tracing::info!(
+            ),
+            ReloadOutcome::Loaded { version } => tracing::info!(
                 target: "cadenza.workflow.reload",
                 path = %self.path.display(),
                 version = version,
                 "workflow reload succeeded",
-            );
+            ),
         }
         outcome
-    }
-
-    fn read_and_parse(&self) -> Result<WorkflowDefinition, WorkflowSourceError> {
-        let bytes = fs::read_to_string(&self.path).map_err(|e| WorkflowSourceError::Io {
-            path: self.path.clone(),
-            source: e,
-        })?;
-        parse_workflow(&bytes).map_err(WorkflowSourceError::from)
-    }
-
-    fn commit_new(&self, definition: WorkflowDefinition) -> ReloadOutcome {
-        let mut state = self.state.write().expect("source state lock poisoned");
-        state.version = state.version.saturating_add(1);
-        state.current = Arc::new(definition);
-        ReloadOutcome::Loaded {
-            version: state.version,
-        }
-    }
-
-    fn record(&self, outcome: ReloadOutcome) {
-        let mut state = self.state.write().expect("source state lock poisoned");
-        let event = ReloadEvent {
-            at: SystemTime::now(),
-            outcome,
-        };
-        state.last_event = event.clone();
-        if state.history.len() == HISTORY_CAPACITY {
-            state.history.pop_front();
-        }
-        state.history.push_back(event);
     }
 }
 
@@ -211,10 +211,27 @@ pub struct WorkflowWatcher {
 }
 
 impl WorkflowWatcher {
+    /// Watch the **parent directory** rather than the file itself. Editors
+    /// commonly save by writing a sibling tempfile and renaming it over
+    /// the target; a watch on the original inode would silently lose
+    /// updates after the first such save. The callback filters incoming
+    /// notify events by basename so unrelated parent-dir changes are
+    /// ignored.
     pub fn spawn(source: Arc<WorkflowSource>) -> Result<Self, WatchError> {
+        use std::ffi::OsString;
+
         use notify::{EventKind, RecursiveMode, Watcher};
 
         let path = source.path().to_path_buf();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let filename: OsString = path
+            .file_name()
+            .map(|s| s.to_os_string())
+            .unwrap_or_else(|| OsString::from(""));
         let source_for_cb = Arc::clone(&source);
         let mut watcher =
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
@@ -229,14 +246,21 @@ impl WorkflowWatcher {
                         return;
                     }
                 };
-                if matches!(
+                if !matches!(
                     event.kind,
                     EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
                 ) {
+                    return;
+                }
+                let touches_target = event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name().is_some_and(|n| n == filename));
+                if touches_target {
                     source_for_cb.try_reload();
                 }
             })?;
-        watcher.watch(&path, RecursiveMode::NonRecursive)?;
+        watcher.watch(&parent, RecursiveMode::NonRecursive)?;
         Ok(Self {
             _watcher: watcher,
             source,
@@ -422,6 +446,39 @@ prompt body
                 "expected oldest event version > 1 after overflow, got {version}",
             ),
             other => panic!("expected Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watcher_picks_up_replace_via_rename() {
+        // Many editors (Vim, IntelliJ, etc.) save by writing a sibling
+        // tempfile and renaming it over the target. Watching the file
+        // directly loses the inode and stops delivering events; the
+        // watcher must observe the parent directory and filter by name.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("WORKFLOW.md");
+        fs::write(&path, VALID_BODY).unwrap();
+        let src = Arc::new(WorkflowSource::load_initial(&path).unwrap());
+        let _watcher = WorkflowWatcher::spawn(Arc::clone(&src)).expect("spawn watcher");
+
+        let tmp = dir.path().join("WORKFLOW.md.tmp");
+        let bumped = VALID_BODY.replace(r#"token: "secret""#, r#"token: "renamed""#);
+        fs::write(&tmp, &bumped).unwrap();
+        fs::rename(&tmp, &path).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if src.version() >= 2 && src.current().config.tracker.token == "renamed" {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "watcher did not pick up rename-replace within 5s; last_event = {:?}, version = {}",
+                    src.last_event(),
+                    src.version(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
 
