@@ -10,3 +10,6 @@ repository.workspace = true
 camino.workspace = true
 cadenza-core = { path = "../cadenza-core" }
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
