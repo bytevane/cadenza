@@ -1,0 +1,27 @@
+# Cadenza version ledger.
+# Fill exact versions during bootstrap and commit changes in a dedicated "version freeze" PR.
+
+[upstream]
+symphony_spec_sha = "TODO-pin-openai-symphony-SPEC.md-commit"
+
+[rust]
+channel = "stable"
+minimum_workspace_rust_version = "1.85"
+wasm_target = "wasm32-wasip2"
+
+[codex]
+# Do not use "latest" in production images. Pin an exact CLI/app-server version here.
+cli_version = "TODO-pin-exact-codex-version"
+transport = "stdio://"
+schema_sha256 = "TODO-generate-with-scripts/codex-schema.sh"
+
+[wasm]
+wasmtime_family = "46"
+wit_package = "cadenza:runtime@0.1.0"
+wasm_tools_version = "TODO-pin-exact-wasm-tools-version"
+wit_bindgen_version = "TODO-pin-exact-wit-bindgen-version-if-used"
+
+[claude_code]
+# Claude Code is a development-time generator/reviewer, not a production runtime dependency.
+cli_or_sdk_version = "TODO-pin-if-used-in-CI"
+allowed_modes = ["claude -p", "Agent SDK"]

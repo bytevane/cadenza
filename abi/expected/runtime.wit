@@ -1,0 +1,128 @@
+package cadenza:runtime@0.1.0;
+
+/// Shared value and error types for Cadenza host-mediated Wasm extensions.
+interface types {
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    enum http-method {
+        get,
+        post,
+        put,
+        patch,
+        delete,
+    }
+
+    enum graphql-mode {
+        read,
+        write,
+    }
+
+    variant host-error {
+        denied(string),
+        invalid-argument(string),
+        not-found(string),
+        outside-root,
+        timeout,
+        rate-limited(option<u32>),
+        upstream(string),
+        io(string),
+        internal(string),
+    }
+
+    record header {
+        name: string,
+        value: string,
+    }
+
+    record http-request {
+        method: http-method,
+        url: string,
+        headers: list<header>,
+        body: option<list<u8>>,
+        timeout-ms: option<u32>,
+    }
+
+    record http-response {
+        status: u16,
+        headers: list<header>,
+        body: list<u8>,
+    }
+
+    record workspace-read-result {
+        path: string,
+        bytes: list<u8>,
+        truncated: bool,
+    }
+
+    record graphql-response {
+        status: u16,
+        body-json: string,
+    }
+
+    record tool-input {
+        name: string,
+        args-json: string,
+    }
+
+    record tool-output {
+        result-json: string,
+        is-error: bool,
+    }
+}
+
+interface host-log {
+    use types.{log-level, host-error};
+    log: func(level: log-level, target: option<string>, message: string, fields-json: option<string>) -> result<_, host-error>;
+}
+
+interface host-time {
+    now-millis: func() -> u64;
+}
+
+interface host-workspace {
+    use types.{host-error, workspace-read-result};
+    workspace-read: func(path: string, offset: option<u64>, limit: option<u64>, as-text: bool) -> result<workspace-read-result, host-error>;
+}
+
+interface host-http {
+    use types.{host-error, http-request, http-response};
+    http-request: func(req: http-request) -> result<http-response, host-error>;
+}
+
+interface host-secrets {
+    use types.{host-error};
+    secret-exists: func(name: string) -> result<bool, host-error>;
+}
+
+interface host-linear {
+    use types.{graphql-mode, graphql-response, host-error};
+    linear-graphql: func(operation-name: option<string>, query: string, variables-json: string, mode: graphql-mode) -> result<graphql-response, host-error>;
+}
+
+interface host-tools {
+    use types.{host-error, tool-input, tool-output};
+    tool-invoke: func(input: tool-input, timeout-ms: option<u32>) -> result<tool-output, host-error>;
+}
+
+interface tool {
+    use types.{host-error, tool-input, tool-output};
+    run: func(input: tool-input) -> result<tool-output, host-error>;
+}
+
+world tool-runtime {
+    import host-log;
+    import host-time;
+    import host-workspace;
+    import host-http;
+    import host-secrets;
+    import host-linear;
+    import host-tools;
+
+    export tool;
+}

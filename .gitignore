@@ -1,0 +1,7 @@
+/target/
+/.codex-schema.sha256.tmp
+/tmp/
+.DS_Store
+.env
+.env.*
+!.env.example
