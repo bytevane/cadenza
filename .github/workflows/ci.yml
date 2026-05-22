@@ -35,8 +35,29 @@ jobs:
 
   codex-schema-gate:
     runs-on: ubuntu-latest
-    if: false # Enable in Issue #4 once schemas/codex/current/ and ci/expected/codex-schema.sha256 are populated.
     steps:
       - uses: actions/checkout@v4
+      - name: Install codex CLI (pinned via tools/versions.toml)
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^cli_version[[:space:]]*=/{print $2; exit}' tools/versions.toml)
+          if [ -z "$version" ]; then
+            echo "could not read codex.cli_version from tools/versions.toml" >&2
+            exit 1
+          fi
+          asset="codex-x86_64-unknown-linux-musl.tar.gz"
+          url="https://github.com/openai/codex/releases/download/${version}/${asset}"
+          echo "Installing codex $version from $url"
+          tmp="$(mktemp -d)"
+          curl --fail --location --silent --show-error "$url" -o "$tmp/codex.tar.gz"
+          tar -xzf "$tmp/codex.tar.gz" -C "$tmp"
+          bin=$(find "$tmp" -type f -name 'codex*' ! -name '*.tar*' ! -name '*.sigstore' -perm -u+x | head -n1)
+          if [ -z "$bin" ]; then
+            echo "could not locate codex binary inside $asset:" >&2
+            tar -tzf "$tmp/codex.tar.gz" | head -20 >&2
+            exit 1
+          fi
+          sudo install -m 0755 "$bin" /usr/local/bin/codex
+          codex --version
       - name: Generate Codex schema and compare hash
         run: ./scripts/codex-schema.sh --check
