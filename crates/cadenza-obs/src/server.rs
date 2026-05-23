@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::{get, post};
 use serde::Serialize;
 
-use crate::snapshot::{IssueRunningView, RetryView, RuntimeSnapshot, redact_snapshot};
+use crate::snapshot::{IssueRunningView, RetryView, RuntimeSnapshot, redact_snapshot, scrub_text};
 
 /// The orchestrator implements this so the obs server can read state
 /// without coupling to its concrete type.
@@ -113,13 +113,16 @@ async fn post_refresh<P: SnapshotProvider>(
 ) -> impl IntoResponse {
     match state.provider.refresh().await {
         Ok(()) => (StatusCode::OK, Json(RefreshResponse { status: "ok" })).into_response(),
-        Err(msg) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(RefreshResponse {
-                status: msg.as_str(),
-            }),
-        )
-            .into_response(),
+        Err(msg) => {
+            let scrubbed = scrub_text(&msg);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RefreshResponse {
+                    status: scrubbed.as_str(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -136,6 +139,7 @@ mod tests {
         snapshot: RuntimeSnapshot,
         refresh_count: tokio::sync::Mutex<u32>,
         fail_refresh: bool,
+        refresh_error: Option<String>,
     }
 
     #[async_trait]
@@ -146,7 +150,10 @@ mod tests {
         async fn refresh(&self) -> Result<(), String> {
             *self.refresh_count.lock().await += 1;
             if self.fail_refresh {
-                Err("simulated".into())
+                Err(self
+                    .refresh_error
+                    .clone()
+                    .unwrap_or_else(|| "simulated".into()))
             } else {
                 Ok(())
             }
@@ -188,6 +195,17 @@ mod tests {
             snapshot: stub_snapshot(),
             refresh_count: tokio::sync::Mutex::new(0),
             fail_refresh: false,
+            refresh_error: None,
+        });
+        router(state)
+    }
+
+    fn app_with_refresh_error(msg: &str) -> Router {
+        let state = ObsAppState::new(StubProvider {
+            snapshot: stub_snapshot(),
+            refresh_count: tokio::sync::Mutex::new(0),
+            fail_refresh: true,
+            refresh_error: Some(msg.into()),
         });
         router(state)
     }
@@ -271,6 +289,7 @@ mod tests {
             snapshot: stub_snapshot(),
             refresh_count: tokio::sync::Mutex::new(0),
             fail_refresh: false,
+            refresh_error: None,
         });
         let counter = Arc::clone(&state.provider);
         let app = router(state);
@@ -289,11 +308,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_endpoint_redacts_secret_in_error_body() {
+        // Regression for #59: post_refresh used to serialize the raw
+        // provider error string into the HTTP response. Upstream
+        // reload diagnostics can contain token-shaped substrings,
+        // which leaked verbatim to API callers. The error must now
+        // go through the same scrubber as the snapshot body.
+        let resp =
+            app_with_refresh_error("failed to load: LINEAR_API_KEY=ghs_secret_value invalid")
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/refresh")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let v = body_json(resp).await;
+        let body = v["status"].as_str().unwrap();
+        assert!(
+            !body.contains("ghs_secret_value"),
+            "leaked secret in refresh error body: {body}",
+        );
+        assert!(
+            body.contains("LINEAR_API_KEY=[REDACTED]"),
+            "no redaction marker in refresh error body: {body}",
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_endpoint_surfaces_provider_error() {
         let state = ObsAppState::new(StubProvider {
             snapshot: stub_snapshot(),
             refresh_count: tokio::sync::Mutex::new(0),
             fail_refresh: true,
+            refresh_error: None,
         });
         let resp = router(state)
             .oneshot(
