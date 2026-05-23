@@ -108,12 +108,19 @@ impl RuntimeState {
     }
 
     pub fn has_capacity(&self) -> bool {
-        self.running.len() < self.max_concurrent_agents
+        self.claimed.len() < self.max_concurrent_agents
     }
 
+    /// In-flight work count = `claimed.len()`. `start_run` is an upsert
+    /// into both `claimed` and `running`, and `complete_run` /
+    /// lifecycle release paths remove from both, so `claimed` is always
+    /// a superset of `running`. Using `claimed.len()` here closes the
+    /// window where a claim has been recorded but `start_run` has not
+    /// yet flipped `running` — without this, a second `select_dispatch`
+    /// tick would treat the slot as free and over-dispatch (see #55).
     pub fn remaining_capacity(&self) -> usize {
         self.max_concurrent_agents
-            .saturating_sub(self.running.len())
+            .saturating_sub(self.claimed.len())
     }
 
     pub fn is_claimed(&self, issue_id: &str) -> bool {
@@ -441,6 +448,37 @@ mod tests {
         assert!(plan_2.to_dispatch.is_empty());
         for outcome in &plan_2.skipped {
             assert!(matches!(outcome.outcome, Some(SkipReason::AlreadyClaimed)));
+        }
+    }
+
+    #[test]
+    fn claimed_but_not_running_consumes_capacity() {
+        // Regression for #58: capacity must include claimed-not-yet-running
+        // work or a second tick (with fresh candidates) can dispatch past
+        // `max_concurrent_agents`. Capacity 2: claim A and B (no
+        // start_run), then ask to dispatch C and D — expect 0 dispatched
+        // and both reported `AtCapacity`.
+        let mut s = state_with(&["todo"], &["done"], 2);
+        s.claim("a");
+        s.claim("b");
+        let plan = s.select_dispatch(
+            &[
+                issue("c", "CAD-3", "todo", Some(1)),
+                issue("d", "CAD-4", "todo", Some(1)),
+            ],
+            0,
+        );
+        assert!(
+            plan.to_dispatch.is_empty(),
+            "over-dispatched past max_concurrent_agents: {plan:?}",
+        );
+        for outcome in &plan.skipped {
+            assert!(
+                matches!(outcome.outcome, Some(SkipReason::AtCapacity)),
+                "wrong skip reason for {}: {:?}",
+                outcome.identifier,
+                outcome.outcome,
+            );
         }
     }
 
