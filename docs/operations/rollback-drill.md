@@ -81,9 +81,25 @@ upstream artifact (Codex CLI version, WIT package) back to match.
 
 ### 5. Restart with the same workflow
 
+The MVP `cadenza-cli` binary currently exposes only operator helpers
+(`doctor`, `workspace-key`, `workspace-path`). The supervised
+long-running run loop is the operator's responsibility for now —
+typical wiring is a systemd unit that invokes the operator's
+preferred entrypoint into the orchestrator library:
+
 ```bash
-cargo run --release -p cadenza-cli -- run --workflow WORKFLOW.md
+# Sanity-check the workflow parses against the rolled-back binary
+# before bringing the supervised process back up.
+cargo run --release -p cadenza-cli -- doctor --workflow WORKFLOW.md
+
+# Then start the supervised service that hosts cadenza_orchestrator's
+# poll loop (operator-specific; example systemd unit shown).
+systemctl start cadenza
 ```
+
+A first-class `cadenza-cli run` subcommand will land in a future
+issue alongside #18/#19 wiring; until then this step is intentionally
+operator-side.
 
 The orchestrator will reconcile from the tracker on boot. Per the
 `reconcile_from_tracker` contract from #19:
