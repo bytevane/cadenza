@@ -194,8 +194,8 @@ async fn mvp_smoke_drives_one_issue_end_to_end() {
     state.apply_lifecycle(&decision);
     assert!(state.running.is_empty(), "run slot released");
     assert!(
-        state.claimed.contains(&issue.id),
-        "claim retained for continuation"
+        !state.claimed.contains(&issue.id),
+        "claim released for continuation so the next tick can re-admit (#49)"
     );
 
     // 9. Project state into the observability snapshot and verify it

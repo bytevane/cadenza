@@ -228,9 +228,13 @@ impl RuntimeState {
     pub fn apply_lifecycle(&mut self, decision: &LifecycleDecision) {
         match decision {
             LifecycleDecision::Continuation { issue_id, .. } => {
-                // Continuation releases the running slot but keeps
-                // the claim for the next dispatch tick.
+                // Release BOTH the running slot AND the claim so the
+                // next select_dispatch can readmit this issue. Holding
+                // the claim here permanently stalls the continuation
+                // path because `classify` returns AlreadyClaimed
+                // before evaluating anything else (#49).
                 self.running.remove(issue_id);
+                self.claimed.remove(issue_id);
                 self.retry_attempts.remove(issue_id);
             }
             LifecycleDecision::Retry {
@@ -239,9 +243,15 @@ impl RuntimeState {
                 due_at_ms,
                 reason,
             } => {
+                // Release the running slot AND the claim. Readmission
+                // is gated by the retry queue: `classify` evaluates
+                // `retry_attempts` and returns `RetryPending` until
+                // `due_at_ms` passes, then admits the issue. Holding
+                // the claim here would make retries permanently
+                // unreachable because `classify` checks `claimed`
+                // before `retry_attempts` (#49).
                 self.running.remove(issue_id);
-                // Hold the claim so the next select_dispatch sees
-                // AlreadyClaimed until the retry fires.
+                self.claimed.remove(issue_id);
                 self.retry_attempts.insert(
                     issue_id.clone(),
                     RetryEntry {
@@ -400,7 +410,10 @@ mod tests {
     // ---------- apply_lifecycle ----------
 
     #[test]
-    fn continuation_releases_running_slot_but_keeps_claim() {
+    fn continuation_releases_running_slot_and_claim() {
+        // Per #49: claim MUST be released after a continuation so the
+        // next select_dispatch tick can re-admit the issue. The prior
+        // version of this test asserted the bug (claim retained).
         let mut s = RuntimeState::new(5_000, 2);
         s.adopt_workflow(1, ["todo".into()], ["done".into()]);
         let attempt = cadenza_core::RunAttempt {
@@ -419,12 +432,66 @@ mod tests {
             next_attempt: 2,
         });
         assert_eq!(s.running.len(), 0);
-        // Claim retained — the continuation will dispatch again next tick.
-        assert!(s.claimed.contains("a"));
+        assert!(
+            !s.claimed.contains("a"),
+            "claim must be released after a continuation so the next \
+             tick can re-admit the issue (#49)",
+        );
     }
 
     #[test]
-    fn retry_decision_releases_running_and_enqueues_retry() {
+    fn continuation_is_redispatchable_on_next_tick() {
+        // End-to-end regression for the #49 P1: after a Continuation
+        // decision, select_dispatch must admit the same issue again
+        // (so the next turn fires).
+        use crate::SkipReason;
+        use cadenza_core::Issue;
+        let mut s = RuntimeState::new(5_000, 2);
+        s.adopt_workflow(1, ["todo".into()], ["done".into()]);
+        let attempt = cadenza_core::RunAttempt {
+            issue_id: "a".into(),
+            issue_identifier: "CAD-1".into(),
+            attempt: Some(1),
+            workspace_path: "/tmp".into(),
+            started_at: None,
+            status: cadenza_core::RunStatus::Running,
+            error: None,
+        };
+        s.start_run("a".into(), attempt);
+        s.apply_lifecycle(&LifecycleDecision::Continuation {
+            issue_id: "a".into(),
+            next_attempt: 2,
+        });
+        let issue = Issue {
+            id: "a".into(),
+            identifier: "CAD-1".into(),
+            title: "x".into(),
+            description: None,
+            priority: Some(1),
+            state: "todo".into(),
+            branch_name: None,
+            url: None,
+            labels: vec![],
+            blocked_by: vec![],
+            created_at: Some("2026-05-23T00:00:00Z".into()),
+            updated_at: None,
+        };
+        let plan = s.select_dispatch(&[issue], 0);
+        assert_eq!(plan.to_dispatch.len(), 1, "continuation must redispatch");
+        // None of the skip reasons should mention this issue.
+        assert!(
+            plan.skipped.iter().all(
+                |c| c.issue_id != "a" || !matches!(c.outcome, Some(SkipReason::AlreadyClaimed))
+            ),
+            "must not be skipped as AlreadyClaimed: {:?}",
+            plan.skipped,
+        );
+    }
+
+    #[test]
+    fn retry_decision_releases_running_claim_and_enqueues_retry() {
+        // Per #49: retry MUST release both running and claim. Readmission
+        // is gated by the retry queue's due_at_ms.
         let mut s = RuntimeState::new(5_000, 2);
         s.adopt_workflow(1, ["todo".into()], ["done".into()]);
         let attempt = cadenza_core::RunAttempt {
@@ -444,10 +511,64 @@ mod tests {
             reason: "boom".into(),
         });
         assert!(s.running.is_empty());
+        assert!(
+            !s.claimed.contains("a"),
+            "claim must be released for retry (#49)"
+        );
         let retry = s.retry_attempts.get("a").unwrap();
         assert_eq!(retry.attempt, 2);
         assert_eq!(retry.due_at_ms, 2_500);
         assert_eq!(retry.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn retry_is_redispatchable_after_backoff_expires() {
+        // End-to-end regression for the #49 P1: after a Retry decision
+        // with due_at_ms in the past, select_dispatch must admit the
+        // same issue again. Previously the held claim short-circuited
+        // classify() before retry_attempts was evaluated.
+        use cadenza_core::Issue;
+        let mut s = RuntimeState::new(5_000, 2);
+        s.adopt_workflow(1, ["todo".into()], ["done".into()]);
+        let attempt = cadenza_core::RunAttempt {
+            issue_id: "a".into(),
+            issue_identifier: "CAD-1".into(),
+            attempt: Some(1),
+            workspace_path: "/tmp".into(),
+            started_at: None,
+            status: cadenza_core::RunStatus::Running,
+            error: None,
+        };
+        s.start_run("a".into(), attempt);
+        s.apply_lifecycle(&LifecycleDecision::Retry {
+            issue_id: "a".into(),
+            attempt: 2,
+            due_at_ms: 1_000,
+            reason: "boom".into(),
+        });
+        let issue = Issue {
+            id: "a".into(),
+            identifier: "CAD-1".into(),
+            title: "x".into(),
+            description: None,
+            priority: Some(1),
+            state: "todo".into(),
+            branch_name: None,
+            url: None,
+            labels: vec![],
+            blocked_by: vec![],
+            created_at: Some("2026-05-23T00:00:00Z".into()),
+            updated_at: None,
+        };
+        // Boundary law: still-pending (due in the future) MUST skip;
+        // expired (due in the past) MUST admit.
+        let plan_pending = s.select_dispatch(std::slice::from_ref(&issue), 500);
+        assert!(
+            plan_pending.to_dispatch.is_empty(),
+            "retry not yet due → skip"
+        );
+        let plan_due = s.select_dispatch(&[issue], 5_000);
+        assert_eq!(plan_due.to_dispatch.len(), 1, "retry past due → redispatch");
     }
 
     #[test]
