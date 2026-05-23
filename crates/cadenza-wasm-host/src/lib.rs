@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use wasmtime::component::Component;
-use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store};
 
 /// Frozen WIT identity of the cadenza host. Plugins must declare the
 /// same package and world in their `WasmComponentRef`. The ABI gate
@@ -82,7 +82,6 @@ pub enum WasmHostError {
 /// a small request-context shell; host capability functions in #16
 /// will extend this with credentials, workspace handle, etc.
 pub struct StoreState {
-    pub limits: StoreLimits,
     pub limiter: RuntimeLimiter,
     pub request: RequestContext,
 }
@@ -97,13 +96,15 @@ pub struct RequestContext {
     pub workspace_path: Option<PathBuf>,
 }
 
-/// Resource limiter Wasmtime consults during memory/table growth.
-/// Tracks the configured caps and a counter of denied growth attempts
-/// so tests can assert breach behaviour.
+/// Resource limiter Wasmtime consults during memory/table growth AND
+/// at instance/memory/table allocation time. Tracks configured caps
+/// plus a counter of denied growth attempts so tests can assert
+/// breach behaviour.
 #[derive(Debug, Clone)]
 pub struct RuntimeLimiter {
     max_memory_bytes: usize,
     max_tables: usize,
+    max_instances: usize,
     denied_growth: usize,
 }
 
@@ -112,6 +113,7 @@ impl RuntimeLimiter {
         Self {
             max_memory_bytes: limits.max_memory_bytes,
             max_tables: limits.max_tables,
+            max_instances: limits.max_instances,
             denied_growth: 0,
         }
     }
@@ -126,6 +128,10 @@ impl RuntimeLimiter {
 
     pub fn max_tables(&self) -> usize {
         self.max_tables
+    }
+
+    pub fn max_instances(&self) -> usize {
+        self.max_instances
     }
 }
 
@@ -154,6 +160,14 @@ impl ResourceLimiter for RuntimeLimiter {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Cap on the number of component instances per store. Wasmtime's
+    /// default is 10_000; without this override the configured
+    /// `max_instances` is silently ignored once we switched away from
+    /// `StoreLimits` (PR #52 codex P1).
+    fn instances(&self) -> usize {
+        self.max_instances
     }
 }
 
@@ -225,22 +239,16 @@ impl ComponentRuntime {
     /// deadline elapses without progress, Wasmtime traps the guest
     /// and `WasmHostError::Timeout` is returned by the caller.
     pub fn new_store(&self, request: RequestContext) -> Store<StoreState> {
-        // `StoreLimits` covers max_instances (a single counter wasmtime
-        // checks at instantiation). Memory and tables are enforced via
-        // the custom `RuntimeLimiter` below so `denied_growth` can be
-        // surfaced for observability.
-        let limits = StoreLimitsBuilder::new()
-            .instances(self.limits.max_instances)
-            .build();
+        // `RuntimeLimiter` enforces memory/table growth (size) AND
+        // the instance-allocation cap (count) via its `instances()`
+        // method. There is no separate `StoreLimits` because the
+        // configured caps must reflect in `denied_growth` for
+        // observability — see PR #52 codex P1.
         let state = StoreState {
-            limits,
             limiter: RuntimeLimiter::new(&self.limits),
             request,
         };
         let mut store = Store::new(&self.engine, state);
-        // Wire the CUSTOM RuntimeLimiter into wasmtime's resource hook
-        // so memory/table growth checks actually run through our caps
-        // and `denied_growth` reflects real denials (#48 P2).
         store.limiter(|s| &mut s.limiter);
         // Use the configured epoch budget (#48 P1). The orchestrator
         // advances the engine epoch via `Engine::increment_epoch` at a
@@ -381,6 +389,22 @@ mod tests {
             runtime.limits().max_memory_bytes
         );
         assert_eq!(data.limiter.max_tables(), runtime.limits().max_tables);
+        // PR #52 codex P1: max_instances must flow through the limiter
+        // since StoreLimits is gone.
+        assert_eq!(data.limiter.max_instances(), runtime.limits().max_instances);
+    }
+
+    #[test]
+    fn limiter_reports_instances_cap_to_wasmtime() {
+        // Direct ResourceLimiter probe: the trait's `instances()`
+        // method must return the configured cap so wasmtime enforces
+        // it at instantiation. Default trait impl returns 10_000.
+        let limits = WasmRuntimeLimits {
+            max_instances: 3,
+            ..Default::default()
+        };
+        let limiter = RuntimeLimiter::new(&limits);
+        assert_eq!(ResourceLimiter::instances(&limiter), 3);
     }
 
     #[test]
