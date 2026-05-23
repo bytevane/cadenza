@@ -209,16 +209,27 @@ impl RuntimeState {
             }
         }
 
-        // Step 2: deterministic sort. Note that `Option<T>::cmp` puts
-        // `None < Some(_)`, which would let undated issues jump the
-        // "older first" queue (see #56). Map `None` to a `is_missing`
-        // boolean so missing timestamps sort after every present one.
+        // Step 2: deterministic sort.
+        //
+        // Priority bucket: Linear uses `0` to mean "no priority" and
+        // `1..=4` for urgent..low. Treat `Some(0)` the same as `None`
+        // so unprioritised work cannot jump ahead of urgent (see #57).
+        //
+        // Timestamp bucket: `Option<T>::cmp` puts `None < Some(_)`,
+        // which would let undated issues jump the "older first" queue
+        // (see #56). Map `None` to a leading boolean so missing
+        // timestamps sort after every present one.
+        fn priority_key(p: Option<i64>) -> i64 {
+            match p {
+                Some(n) if n >= 1 => n,
+                _ => i64::MAX,
+            }
+        }
         admitted.sort_by(|a, b| {
             let a_ts = (a.created_at.is_none(), &a.created_at);
             let b_ts = (b.created_at.is_none(), &b.created_at);
-            a.priority
-                .unwrap_or(i64::MAX)
-                .cmp(&b.priority.unwrap_or(i64::MAX))
+            priority_key(a.priority)
+                .cmp(&priority_key(b.priority))
                 .then_with(|| a_ts.cmp(&b_ts))
                 .then_with(|| a.identifier.cmp(&b.identifier))
         });
@@ -589,6 +600,35 @@ mod tests {
         };
         let plan = s.select_dispatch(&[dated_b.clone(), dated.clone()], 0);
         assert_eq!(plan.to_dispatch[0].identifier, "CAD-1");
+    }
+
+    #[test]
+    fn priority_zero_is_treated_as_no_priority() {
+        // Regression for #57: Linear uses `0` to mean "no priority";
+        // the selector previously sorted Some(0) before Some(1) and
+        // dispatched unprioritised work ahead of urgent. Equal-otherwise
+        // candidates with Some(0) and Some(1): the urgent one must run.
+        let s = state_with(&["todo"], &["done"], 1);
+        let urgent = issue("u", "CAD-1", "todo", Some(1));
+        let unprioritised = issue("n", "CAD-2", "todo", Some(0));
+        // Put the unprioritised candidate first so the bug, if present,
+        // keeps it ahead.
+        let plan = s.select_dispatch(&[unprioritised.clone(), urgent.clone()], 0);
+        assert_eq!(plan.to_dispatch.len(), 1);
+        assert_eq!(
+            plan.to_dispatch[0].identifier, "CAD-1",
+            "no-priority issue jumped ahead of urgent: {plan:?}",
+        );
+        // Some(0) and None must end up in the same tail bucket.
+        let plan_none_vs_zero = s.select_dispatch(
+            &[
+                issue("z", "CAD-3", "todo", Some(0)),
+                issue("nn", "CAD-4", "todo", None),
+                issue("hi", "CAD-5", "todo", Some(2)),
+            ],
+            0,
+        );
+        assert_eq!(plan_none_vs_zero.to_dispatch[0].identifier, "CAD-5");
     }
 
     #[test]
