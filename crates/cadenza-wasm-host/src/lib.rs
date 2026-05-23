@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use wasmtime::component::Component;
-use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store};
 
 /// Frozen WIT identity of the cadenza host. Plugins must declare the
 /// same package and world in their `WasmComponentRef`. The ABI gate
@@ -82,7 +82,6 @@ pub enum WasmHostError {
 /// a small request-context shell; host capability functions in #16
 /// will extend this with credentials, workspace handle, etc.
 pub struct StoreState {
-    pub limits: StoreLimits,
     pub limiter: RuntimeLimiter,
     pub request: RequestContext,
 }
@@ -97,13 +96,15 @@ pub struct RequestContext {
     pub workspace_path: Option<PathBuf>,
 }
 
-/// Resource limiter Wasmtime consults during memory/table growth.
-/// Tracks the configured caps and a counter of denied growth attempts
-/// so tests can assert breach behaviour.
+/// Resource limiter Wasmtime consults during memory/table growth AND
+/// at instance/memory/table allocation time. Tracks configured caps
+/// plus a counter of denied growth attempts so tests can assert
+/// breach behaviour.
 #[derive(Debug, Clone)]
 pub struct RuntimeLimiter {
     max_memory_bytes: usize,
     max_tables: usize,
+    max_instances: usize,
     denied_growth: usize,
 }
 
@@ -112,12 +113,25 @@ impl RuntimeLimiter {
         Self {
             max_memory_bytes: limits.max_memory_bytes,
             max_tables: limits.max_tables,
+            max_instances: limits.max_instances,
             denied_growth: 0,
         }
     }
 
     pub fn denied_growth(&self) -> usize {
         self.denied_growth
+    }
+
+    pub fn max_memory_bytes(&self) -> usize {
+        self.max_memory_bytes
+    }
+
+    pub fn max_tables(&self) -> usize {
+        self.max_tables
+    }
+
+    pub fn max_instances(&self) -> usize {
+        self.max_instances
     }
 }
 
@@ -146,6 +160,22 @@ impl ResourceLimiter for RuntimeLimiter {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Cap on the number of component instances per store. Wasmtime's
+    /// default is 10_000; without this override the configured
+    /// `max_instances` is silently ignored once we switched away from
+    /// `StoreLimits` (PR #52 codex P1).
+    fn instances(&self) -> usize {
+        self.max_instances
+    }
+
+    /// Cap on the number of tables a component can allocate. Same story
+    /// as `instances()` — wasmtime defaults to 10_000 here too, so
+    /// without this override `max_tables` only constrains the growth of
+    /// each individual table, not how many tables exist (PR #52 codex P2).
+    fn tables(&self) -> usize {
+        self.max_tables
     }
 }
 
@@ -217,24 +247,34 @@ impl ComponentRuntime {
     /// deadline elapses without progress, Wasmtime traps the guest
     /// and `WasmHostError::Timeout` is returned by the caller.
     pub fn new_store(&self, request: RequestContext) -> Store<StoreState> {
-        let limits = StoreLimitsBuilder::new()
-            .memory_size(self.limits.max_memory_bytes)
-            .tables(self.limits.max_tables)
-            .instances(self.limits.max_instances)
-            .build();
+        // `RuntimeLimiter` enforces memory/table growth (size) AND
+        // the instance- and table-allocation caps (count) via its
+        // `instances()` / `tables()` methods. There is no separate
+        // `StoreLimits` because the configured caps must reflect in
+        // `denied_growth` for observability — see PR #52 codex P1/P2.
         let state = StoreState {
-            limits,
             limiter: RuntimeLimiter::new(&self.limits),
             request,
         };
         let mut store = Store::new(&self.engine, state);
-        store.limiter(|s| &mut s.limits);
-        // Epoch deadline accumulates ticks until the orchestrator's
-        // `Engine::increment_epoch` loop matches. The initial `1` means
-        // "trap on the first tick if the orchestrator never advances",
-        // making timeout the default.
-        store.set_epoch_deadline(1);
+        store.limiter(|s| &mut s.limiter);
+        // Use the configured epoch budget (#48 P1). The orchestrator
+        // advances the engine epoch via `Engine::increment_epoch` at a
+        // fixed cadence (target: 1 tick per millisecond), so this
+        // deadline expressed in *ticks* approximates the budget in ms.
+        // A zero or unconfigured budget falls back to 1 so an
+        // unsupervised store still traps rather than running forever.
+        store.set_epoch_deadline(self.epoch_budget_ticks());
         store
+    }
+
+    /// Epoch-deadline value (in ticks) derived from
+    /// `WasmRuntimeLimits::epoch_timeout_ms`. Factored out so tests can
+    /// assert the configured value without instantiating a wasmtime
+    /// store. A zero budget is clamped to 1 so an unsupervised store
+    /// still traps rather than running forever.
+    pub fn epoch_budget_ticks(&self) -> u64 {
+        self.limits.epoch_timeout_ms.max(1)
     }
 }
 
@@ -350,6 +390,68 @@ mod tests {
         assert_eq!(data.request.issue_id.as_deref(), Some("CAD-42"));
         assert_eq!(data.request.workspace_path, Some(PathBuf::from("/tmp/ws")));
         assert_eq!(data.limiter.denied_growth(), 0);
+        // Per #48 P2: the CUSTOM RuntimeLimiter must be the one wired
+        // into wasmtime, so its cap reflects the runtime config.
+        assert_eq!(
+            data.limiter.max_memory_bytes(),
+            runtime.limits().max_memory_bytes
+        );
+        assert_eq!(data.limiter.max_tables(), runtime.limits().max_tables);
+        // PR #52 codex P1: max_instances must flow through the limiter
+        // since StoreLimits is gone.
+        assert_eq!(data.limiter.max_instances(), runtime.limits().max_instances);
+    }
+
+    #[test]
+    fn limiter_reports_instances_cap_to_wasmtime() {
+        // Direct ResourceLimiter probe: the trait's `instances()`
+        // method must return the configured cap so wasmtime enforces
+        // it at instantiation. Default trait impl returns 10_000.
+        let limits = WasmRuntimeLimits {
+            max_instances: 3,
+            ..Default::default()
+        };
+        let limiter = RuntimeLimiter::new(&limits);
+        assert_eq!(ResourceLimiter::instances(&limiter), 3);
+    }
+
+    #[test]
+    fn limiter_reports_tables_cap_to_wasmtime() {
+        // PR #52 codex P2: `table_growing` only constrains individual
+        // table growth, not the *count* of tables a component can
+        // allocate. The trait's `tables()` method must return the
+        // configured cap so wasmtime enforces it at allocation time.
+        // Default trait impl returns 10_000.
+        let limits = WasmRuntimeLimits {
+            max_tables: 5,
+            ..Default::default()
+        };
+        let limiter = RuntimeLimiter::new(&limits);
+        assert_eq!(ResourceLimiter::tables(&limiter), 5);
+    }
+
+    #[test]
+    fn epoch_budget_uses_configured_timeout() {
+        // Per #48 P1: the deadline MUST derive from
+        // `epoch_timeout_ms`, not be hardcoded to 1.
+        let limits = WasmRuntimeLimits {
+            epoch_timeout_ms: 7_500,
+            ..Default::default()
+        };
+        let runtime = ComponentRuntime::new(limits).unwrap();
+        assert_eq!(runtime.epoch_budget_ticks(), 7_500);
+    }
+
+    #[test]
+    fn epoch_budget_zero_clamps_to_one() {
+        // Boundary: a zero budget must still trap rather than letting
+        // an unsupervised store run forever.
+        let limits = WasmRuntimeLimits {
+            epoch_timeout_ms: 0,
+            ..Default::default()
+        };
+        let runtime = ComponentRuntime::new(limits).unwrap();
+        assert_eq!(runtime.epoch_budget_ticks(), 1);
     }
 
     #[test]
