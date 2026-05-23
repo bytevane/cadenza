@@ -40,7 +40,10 @@ pub fn redact_value(key: &str, value: &str) -> String {
 /// independent allow-lists.
 ///
 /// Covers the issue #21 set: `*_TOKEN`, `*_KEY`, `secret`,
-/// `password`, `authorization`, `cookie`.
+/// `password`, `authorization`, `cookie`. Hyphenated HTTP-header
+/// shapes like `x-api-key` match via the `-key` suffix branch
+/// (see #61); `api-key-name` is intentionally NOT matched because
+/// the suffix is `-name`, not `-key`.
 pub fn looks_secret(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key.contains("token")
@@ -49,6 +52,7 @@ pub fn looks_secret(key: &str) -> bool {
         || key.contains("authorization")
         || key.contains("cookie")
         || key.ends_with("_key")
+        || key.ends_with("-key")
 }
 
 #[cfg(test)]

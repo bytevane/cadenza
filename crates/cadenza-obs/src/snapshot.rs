@@ -107,8 +107,10 @@ pub(crate) fn scrub_text(text: &str) -> String {
         let (head, tail) = rest.split_at(sep_pos);
         let head_trimmed = head.trim_end();
         let trailing_ws_len = head.len() - head_trimmed.len();
+        // Include `-` in the key char class so hyphenated HTTP-header
+        // shapes like `x-api-key` aren't split at the dash (see #61).
         let key_start = head_trimmed
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
             .map(|i| i + 1)
             .unwrap_or(0);
         let key = &head_trimmed[key_start..];
@@ -253,6 +255,35 @@ mod tests {
         assert!(!s.contains("session=v1"), "leaked cookie body: {s}");
         assert!(!s.contains("lang=en"), "leaked tail of cookie line: {s}");
         assert!(s.contains("plain text"), "newline boundary lost: {s}");
+    }
+
+    #[test]
+    fn scrub_text_redacts_hyphenated_secret_keys() {
+        // Regression for #61: the key class only included alnum + `_`,
+        // so `x-api-key=...` was reduced to `key`, which doesn't match
+        // the heuristic, and the value leaked.
+        for input in [
+            "x-api-key=eyJhbGciOiJIUzI1NiIs",
+            "X-API-Key=eyJhbGciOiJIUzI1NiIs",
+            "x-auth-token=ghs_xyz",
+        ] {
+            let s = scrub_text(input);
+            assert!(
+                !s.contains("eyJhbGciOiJIUzI1NiIs") && !s.contains("ghs_xyz"),
+                "leaked secret in {input:?}: {s}",
+            );
+            assert!(
+                s.contains("[REDACTED]"),
+                "no redaction marker in {input:?}: {s}",
+            );
+        }
+        // Negative controls: hyphenated NON-secret names must not be
+        // redacted. `content-type` is not a secret key shape, and
+        // `api-key-name` ends with `-name`, not `-key`.
+        let s = scrub_text("content-type=text/html");
+        assert_eq!(s, "content-type=text/html");
+        let s = scrub_text("api-key-name=foo");
+        assert_eq!(s, "api-key-name=foo");
     }
 
     #[test]
