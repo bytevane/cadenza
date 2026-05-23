@@ -7,7 +7,7 @@ projection kept in sync with it.
 
 | Surface | Pinned value | Source of truth |
 | --- | --- | --- |
-| Cadenza release | `0.1.0-mvp` | `Cargo.toml` workspace `version` (per-crate) |
+| Cadenza release | `0.1.0` | `Cargo.toml` workspace `version` (per-crate) |
 | Symphony SPEC commit | `2c1851830477434100fdb8980fcc1fce1a8af81d` | `tools/versions.toml` `[upstream] symphony_spec_sha` |
 | Rust toolchain | `1.95.0` (channel `stable`) | `rust-toolchain.toml` + `tools/versions.toml` `[rust] toolchain_version` |
 | Workspace MSRV | `1.85` | `tools/versions.toml` `[rust] minimum_workspace_rust_version` |
