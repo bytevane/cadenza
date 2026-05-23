@@ -119,6 +119,14 @@ impl RuntimeLimiter {
     pub fn denied_growth(&self) -> usize {
         self.denied_growth
     }
+
+    pub fn max_memory_bytes(&self) -> usize {
+        self.max_memory_bytes
+    }
+
+    pub fn max_tables(&self) -> usize {
+        self.max_tables
+    }
 }
 
 impl ResourceLimiter for RuntimeLimiter {
@@ -217,9 +225,11 @@ impl ComponentRuntime {
     /// deadline elapses without progress, Wasmtime traps the guest
     /// and `WasmHostError::Timeout` is returned by the caller.
     pub fn new_store(&self, request: RequestContext) -> Store<StoreState> {
+        // `StoreLimits` covers max_instances (a single counter wasmtime
+        // checks at instantiation). Memory and tables are enforced via
+        // the custom `RuntimeLimiter` below so `denied_growth` can be
+        // surfaced for observability.
         let limits = StoreLimitsBuilder::new()
-            .memory_size(self.limits.max_memory_bytes)
-            .tables(self.limits.max_tables)
             .instances(self.limits.max_instances)
             .build();
         let state = StoreState {
@@ -228,13 +238,27 @@ impl ComponentRuntime {
             request,
         };
         let mut store = Store::new(&self.engine, state);
-        store.limiter(|s| &mut s.limits);
-        // Epoch deadline accumulates ticks until the orchestrator's
-        // `Engine::increment_epoch` loop matches. The initial `1` means
-        // "trap on the first tick if the orchestrator never advances",
-        // making timeout the default.
-        store.set_epoch_deadline(1);
+        // Wire the CUSTOM RuntimeLimiter into wasmtime's resource hook
+        // so memory/table growth checks actually run through our caps
+        // and `denied_growth` reflects real denials (#48 P2).
+        store.limiter(|s| &mut s.limiter);
+        // Use the configured epoch budget (#48 P1). The orchestrator
+        // advances the engine epoch via `Engine::increment_epoch` at a
+        // fixed cadence (target: 1 tick per millisecond), so this
+        // deadline expressed in *ticks* approximates the budget in ms.
+        // A zero or unconfigured budget falls back to 1 so an
+        // unsupervised store still traps rather than running forever.
+        store.set_epoch_deadline(self.epoch_budget_ticks());
         store
+    }
+
+    /// Epoch-deadline value (in ticks) derived from
+    /// `WasmRuntimeLimits::epoch_timeout_ms`. Factored out so tests can
+    /// assert the configured value without instantiating a wasmtime
+    /// store. A zero budget is clamped to 1 so an unsupervised store
+    /// still traps rather than running forever.
+    pub fn epoch_budget_ticks(&self) -> u64 {
+        self.limits.epoch_timeout_ms.max(1)
     }
 }
 
@@ -350,6 +374,37 @@ mod tests {
         assert_eq!(data.request.issue_id.as_deref(), Some("CAD-42"));
         assert_eq!(data.request.workspace_path, Some(PathBuf::from("/tmp/ws")));
         assert_eq!(data.limiter.denied_growth(), 0);
+        // Per #48 P2: the CUSTOM RuntimeLimiter must be the one wired
+        // into wasmtime, so its cap reflects the runtime config.
+        assert_eq!(
+            data.limiter.max_memory_bytes(),
+            runtime.limits().max_memory_bytes
+        );
+        assert_eq!(data.limiter.max_tables(), runtime.limits().max_tables);
+    }
+
+    #[test]
+    fn epoch_budget_uses_configured_timeout() {
+        // Per #48 P1: the deadline MUST derive from
+        // `epoch_timeout_ms`, not be hardcoded to 1.
+        let limits = WasmRuntimeLimits {
+            epoch_timeout_ms: 7_500,
+            ..Default::default()
+        };
+        let runtime = ComponentRuntime::new(limits).unwrap();
+        assert_eq!(runtime.epoch_budget_ticks(), 7_500);
+    }
+
+    #[test]
+    fn epoch_budget_zero_clamps_to_one() {
+        // Boundary: a zero budget must still trap rather than letting
+        // an unsupervised store run forever.
+        let limits = WasmRuntimeLimits {
+            epoch_timeout_ms: 0,
+            ..Default::default()
+        };
+        let runtime = ComponentRuntime::new(limits).unwrap();
+        assert_eq!(runtime.epoch_budget_ticks(), 1);
     }
 
     #[test]
