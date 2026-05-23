@@ -209,12 +209,17 @@ impl RuntimeState {
             }
         }
 
-        // Step 2: deterministic sort.
+        // Step 2: deterministic sort. Note that `Option<T>::cmp` puts
+        // `None < Some(_)`, which would let undated issues jump the
+        // "older first" queue (see #56). Map `None` to a `is_missing`
+        // boolean so missing timestamps sort after every present one.
         admitted.sort_by(|a, b| {
+            let a_ts = (a.created_at.is_none(), &a.created_at);
+            let b_ts = (b.created_at.is_none(), &b.created_at);
             a.priority
                 .unwrap_or(i64::MAX)
                 .cmp(&b.priority.unwrap_or(i64::MAX))
-                .then_with(|| a.created_at.cmp(&b.created_at))
+                .then_with(|| a_ts.cmp(&b_ts))
                 .then_with(|| a.identifier.cmp(&b.identifier))
         });
 
@@ -544,6 +549,46 @@ mod tests {
         }];
         let plan = s.select_dispatch(&[issue_b], 0);
         assert_eq!(plan.to_dispatch.len(), 1);
+    }
+
+    #[test]
+    fn none_created_at_ranks_after_dated_issue() {
+        // Regression for #56: `Option<String>::cmp` puts None before
+        // every Some, so an undated issue jumps to the head of the
+        // "older first" queue. With equal priority, the dated issue
+        // must come first; the undated one must dispatch last.
+        let mut s = state_with(&["todo"], &["done"], 1);
+        let dated = Issue {
+            created_at: Some("2026-01-01T00:00:00Z".into()),
+            ..issue("dated", "CAD-1", "todo", Some(1))
+        };
+        let undated = Issue {
+            created_at: None,
+            ..issue("undated", "CAD-2", "todo", Some(1))
+        };
+        // Order the candidate slice with undated first so the bug,
+        // if present, lets it stay first.
+        let plan = s.select_dispatch(&[undated.clone(), dated.clone()], 0);
+        assert_eq!(plan.to_dispatch.len(), 1);
+        assert_eq!(
+            plan.to_dispatch[0].identifier, "CAD-1",
+            "undated issue jumped queue: {plan:?}",
+        );
+        // Also confirm undated is recorded as the at-capacity skip.
+        let skip = plan
+            .skipped
+            .iter()
+            .find(|c| c.identifier == "CAD-2")
+            .unwrap();
+        assert!(matches!(skip.outcome, Some(SkipReason::AtCapacity)));
+        // Sanity check: when both dated, behaviour unchanged.
+        s.complete_run("dated"); // no-op (it was never started); keeps state clean.
+        let dated_b = Issue {
+            created_at: Some("2026-02-01T00:00:00Z".into()),
+            ..issue("dated_b", "CAD-3", "todo", Some(1))
+        };
+        let plan = s.select_dispatch(&[dated_b.clone(), dated.clone()], 0);
+        assert_eq!(plan.to_dispatch[0].identifier, "CAD-1");
     }
 
     #[test]
