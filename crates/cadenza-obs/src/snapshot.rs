@@ -91,6 +91,11 @@ pub fn redact_snapshot(snapshot: &mut RuntimeSnapshot) {
 /// Punctuation like `;` / `,` / `&` is intentionally NOT a boundary
 /// because opaque secrets can contain those bytes (e.g.
 /// `password=abc&def`); stopping there would leak the suffix.
+///
+/// Whitespace immediately around `=` (`KEY = VALUE` style log dumps)
+/// is tolerated: the key scan trims trailing whitespace from `head`
+/// before searching for the alnum/underscore run, and leading
+/// whitespace from the value is skipped before redaction (see #60).
 pub(crate) fn scrub_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -100,19 +105,34 @@ pub(crate) fn scrub_text(text: &str) -> String {
             break;
         };
         let (head, tail) = rest.split_at(sep_pos);
-        let key_start = head
+        let head_trimmed = head.trim_end();
+        let trailing_ws_len = head.len() - head_trimmed.len();
+        let key_start = head_trimmed
             .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .map(|i| i + 1)
             .unwrap_or(0);
-        let key = &head[key_start..];
+        let key = &head_trimmed[key_start..];
         out.push_str(&head[..key_start]);
         out.push_str(key);
+        // Re-emit any whitespace that sat between the key and `=`
+        // so the operator-facing output keeps its shape.
+        out.push_str(&head[head.len() - trailing_ws_len..]);
         out.push('=');
         let after_sep = &tail[1..];
         if super::looks_secret(key) && !key.is_empty() {
-            let value_end = after_sep.find(['\n', '\r']).unwrap_or(after_sep.len());
+            // Allow whitespace between `=` and the secret value
+            // (`KEY = secret`); re-emit it before the marker so the
+            // shape of the line is preserved.
+            let leading_ws_len = after_sep
+                .find(|c: char| !(c == ' ' || c == '\t'))
+                .unwrap_or(after_sep.len());
+            out.push_str(&after_sep[..leading_ws_len]);
+            let value_region = &after_sep[leading_ws_len..];
+            let value_end = value_region
+                .find(['\n', '\r'])
+                .unwrap_or(value_region.len());
             out.push_str("[REDACTED]");
-            rest = &after_sep[value_end..];
+            rest = &value_region[value_end..];
         } else {
             rest = after_sep;
         }
@@ -233,6 +253,30 @@ mod tests {
         assert!(!s.contains("session=v1"), "leaked cookie body: {s}");
         assert!(!s.contains("lang=en"), "leaked tail of cookie line: {s}");
         assert!(s.contains("plain text"), "newline boundary lost: {s}");
+    }
+
+    #[test]
+    fn scrub_text_handles_whitespace_around_equals() {
+        // Regression for #60: `KEY =value` / `KEY = value` produced an
+        // empty key string (the parser scanned backwards from `=` and
+        // hit the space immediately), so the heuristic missed and the
+        // secret leaked.
+        for input in [
+            "API_KEY =topsecret",
+            "API_KEY= topsecret",
+            "API_KEY = topsecret",
+            "api_key= \"topsecret\"",
+        ] {
+            let s = scrub_text(input);
+            assert!(!s.contains("topsecret"), "leaked secret in {input:?}: {s}",);
+            assert!(
+                s.contains("[REDACTED]"),
+                "no redaction marker in {input:?}: {s}",
+            );
+        }
+        // Sanity: no-space form keeps working.
+        let s = scrub_text("API_KEY=topsecret");
+        assert!(!s.contains("topsecret"), "regressed no-space form: {s}");
     }
 
     #[test]
