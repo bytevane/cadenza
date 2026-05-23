@@ -169,6 +169,14 @@ impl ResourceLimiter for RuntimeLimiter {
     fn instances(&self) -> usize {
         self.max_instances
     }
+
+    /// Cap on the number of tables a component can allocate. Same story
+    /// as `instances()` — wasmtime defaults to 10_000 here too, so
+    /// without this override `max_tables` only constrains the growth of
+    /// each individual table, not how many tables exist (PR #52 codex P2).
+    fn tables(&self) -> usize {
+        self.max_tables
+    }
 }
 
 /// Wasmtime engine + reusable config. Cheap to clone; one per host
@@ -240,10 +248,10 @@ impl ComponentRuntime {
     /// and `WasmHostError::Timeout` is returned by the caller.
     pub fn new_store(&self, request: RequestContext) -> Store<StoreState> {
         // `RuntimeLimiter` enforces memory/table growth (size) AND
-        // the instance-allocation cap (count) via its `instances()`
-        // method. There is no separate `StoreLimits` because the
-        // configured caps must reflect in `denied_growth` for
-        // observability — see PR #52 codex P1.
+        // the instance- and table-allocation caps (count) via its
+        // `instances()` / `tables()` methods. There is no separate
+        // `StoreLimits` because the configured caps must reflect in
+        // `denied_growth` for observability — see PR #52 codex P1/P2.
         let state = StoreState {
             limiter: RuntimeLimiter::new(&self.limits),
             request,
@@ -405,6 +413,21 @@ mod tests {
         };
         let limiter = RuntimeLimiter::new(&limits);
         assert_eq!(ResourceLimiter::instances(&limiter), 3);
+    }
+
+    #[test]
+    fn limiter_reports_tables_cap_to_wasmtime() {
+        // PR #52 codex P2: `table_growing` only constrains individual
+        // table growth, not the *count* of tables a component can
+        // allocate. The trait's `tables()` method must return the
+        // configured cap so wasmtime enforces it at allocation time.
+        // Default trait impl returns 10_000.
+        let limits = WasmRuntimeLimits {
+            max_tables: 5,
+            ..Default::default()
+        };
+        let limiter = RuntimeLimiter::new(&limits);
+        assert_eq!(ResourceLimiter::tables(&limiter), 5);
     }
 
     #[test]
