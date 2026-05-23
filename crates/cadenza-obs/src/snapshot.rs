@@ -83,6 +83,14 @@ pub fn redact_snapshot(snapshot: &mut RuntimeSnapshot) {
 /// `authorization: bearer XXX` puts the secret two tokens past the
 /// separator) so we conservatively leave them. Structured fields that
 /// carry a key/value pair separately should use `redact_value` instead.
+///
+/// The value boundary is "until end-of-line", not the next whitespace —
+/// common credential shapes like `authorization=Bearer <jwt>` or
+/// `x-token=foo bar baz` contain internal spaces and stopping at the
+/// first whitespace would leak the trailing token material (see #58).
+/// Punctuation like `;` / `,` / `&` is intentionally NOT a boundary
+/// because opaque secrets can contain those bytes (e.g.
+/// `password=abc&def`); stopping there would leak the suffix.
 pub(crate) fn scrub_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -102,9 +110,7 @@ pub(crate) fn scrub_text(text: &str) -> String {
         out.push('=');
         let after_sep = &tail[1..];
         if super::looks_secret(key) && !key.is_empty() {
-            let value_end = after_sep
-                .find(|c: char| c.is_whitespace())
-                .unwrap_or(after_sep.len());
+            let value_end = after_sep.find(['\n', '\r']).unwrap_or(after_sep.len());
             out.push_str("[REDACTED]");
             rest = &after_sep[value_end..];
         } else {
@@ -179,6 +185,67 @@ mod tests {
         };
         redact_snapshot(&mut snap);
         assert!(!snap.retry[0].reason.as_ref().unwrap().contains("oops"));
+    }
+
+    #[test]
+    fn scrub_text_redacts_full_bearer_token_after_whitespace() {
+        // Regression for #58: the parser stopped at the first whitespace
+        // after `KEY=`, so `authorization=Bearer <token>` only redacted
+        // `Bearer` and left the actual JWT in the output.
+        let s = scrub_text("authorization=Bearer eyJhbGciOiJIUzI1NiIs.abcdef");
+        assert!(
+            !s.contains("eyJhbGciOiJIUzI1NiIs.abcdef"),
+            "leaked token after Bearer: {s}",
+        );
+        assert!(!s.contains("Bearer"), "leaked Bearer prefix: {s}");
+    }
+
+    #[test]
+    fn scrub_text_redacts_multi_token_value_after_secret_key() {
+        // Regression for #58: any value with spaces should be redacted
+        // in full when the key is secret-shaped.
+        let s = scrub_text("x-token=foo bar baz");
+        assert!(!s.contains("foo"), "leaked first token: {s}");
+        assert!(!s.contains("bar"), "leaked middle token: {s}");
+        assert!(!s.contains("baz"), "leaked tail token: {s}");
+    }
+
+    #[test]
+    fn scrub_text_stops_value_at_newline() {
+        // Regression for #58: redact to end of line so non-secret
+        // content on the next line is preserved for the operator.
+        let s = scrub_text("authorization=Bearer abc xyz\nnext-line content");
+        assert!(!s.contains("Bearer"), "leaked secret: {s}");
+        assert!(!s.contains("xyz"), "leaked tail token: {s}");
+        assert!(
+            s.contains("next-line content"),
+            "newline boundary lost: {s}",
+        );
+    }
+
+    #[test]
+    fn scrub_text_redacts_entire_cookie_line() {
+        // Regression for #58: cookie values can themselves embed
+        // session tokens, so the whole cookie value (everything until
+        // newline) is redacted. Punctuation like `;` is NOT a boundary
+        // because opaque secrets can contain `;` / `,` / `&`.
+        let s = scrub_text("cookie=session=v1; lang=en\nplain text");
+        assert!(!s.contains("session=v1"), "leaked cookie body: {s}");
+        assert!(!s.contains("lang=en"), "leaked tail of cookie line: {s}");
+        assert!(s.contains("plain text"), "newline boundary lost: {s}");
+    }
+
+    #[test]
+    fn scrub_text_keeps_punctuation_inside_secret_value() {
+        // Regression for codex review of #58 fix: opaque secrets can
+        // contain `&` / `,` / `;`. The earlier patch made those
+        // characters end-of-value markers and leaked the suffix.
+        for input in ["password=abc&def", "secret=foo,bar", "token=a;b;c"] {
+            let s = scrub_text(input);
+            assert!(!s.contains("def"), "leaked `&`-suffix in {input}: {s}");
+            assert!(!s.contains("bar"), "leaked `,`-suffix in {input}: {s}");
+            assert!(!s.contains("b;c"), "leaked `;`-suffix in {input}: {s}");
+        }
     }
 
     #[test]
