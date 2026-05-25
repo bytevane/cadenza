@@ -71,12 +71,26 @@ this. This ADR adds the transport that consumes it.
 
 3. **Per-request client timeout from `LinearCall::timeout` — the cancellation
    mechanism.** Each request sets `.timeout(call.timeout)` — the same deadline
-   the host watchdog enforces. When it fires, reqwest stops the request and
-   **drops/cancels it at the transport layer**: on HTTP/1.1 the connection is
-   dropped; on HTTP/2 the stream is reset (`RST_STREAM`). Either way the client
-   stops sending/awaiting and reclaims the worker promptly (complementing ADR
-   0007's process-wide in-flight ceiling), so a timed-out call no longer leaves a
-   worker blocked until the OS tears the socket down.
+   the host watchdog enforces. When it fires during the **send / await-response**
+   phase (where a `GraphqlMode::Write` mutation actually reaches the server),
+   reqwest stops the request and **drops/cancels it at the transport layer**: on
+   HTTP/1.1 the connection is dropped; on HTTP/2 the stream is reset
+   (`RST_STREAM`). The client stops sending/awaiting and the worker is reclaimed,
+   so a timed-out write is no longer silently left in flight.
+
+   Precise scope (do not overclaim): reqwest's *blocking* client applies
+   `call.timeout` **per `read`** on the response body, not as one total budget.
+   The send/await-response phase — the security-relevant one for write
+   cancellation — is bounded by `call.timeout`. A *trickling* response body can
+   hold the detached worker past `call.timeout`; that occupancy is bounded
+   instead by `LinearCall::max_response_bytes` (total bytes read) and the
+   process-wide in-flight worker ceiling of ADR 0007 Decision 5 (which fails
+   closed with `host-error::rate-limited`). The endpoint is host-configured and
+   allowlist-checked, not guest-chosen, so a trickle requires a compromised
+   configured upstream and still degrades fail-closed — the same hung-worker
+   posture ADR 0007's ceiling was designed for. A tighter total-deadline body
+   read is possible future hardening but is not required for the write-
+   cancellation guarantee this issue is about.
 
 4. **HTTP/2 via ALPN, with HTTP/1.1 fallback.** The crate enables reqwest's
    `http2` cargo feature (the workspace pin sets `default-features = false`,

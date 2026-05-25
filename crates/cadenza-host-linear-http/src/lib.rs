@@ -9,12 +9,24 @@
 //!
 //! Cancellation (the reason this crate exists): every request sets its own
 //! deadline from [`LinearCall::timeout`] via `reqwest`'s per-request
-//! `.timeout(..)`. When it fires, reqwest aborts the request at the transport
-//! layer — the HTTP/1.1 connection is dropped or the HTTP/2 stream is reset — so
-//! a timed-out call no longer leaves a worker blocked on the upstream (ADR 0007
-//! "Known limitations", resolved here). Exactly-once for `GraphqlMode::Write` is
-//! still not a client guarantee; non-idempotent mutations need caller-side
+//! `.timeout(..)`. When it fires during the send / await-response phase — where
+//! a `GraphqlMode::Write` mutation actually reaches the server — reqwest aborts
+//! the request at the transport layer (the HTTP/1.1 connection is dropped or the
+//! HTTP/2 stream is reset), so a timed-out write is no longer silently left in
+//! flight (ADR 0007 "Known limitations", resolved here). Exactly-once for writes
+//! is still not a client guarantee; non-idempotent mutations need caller-side
 //! idempotency.
+//!
+//! Scope of the deadline (be precise, do not overclaim): reqwest's blocking
+//! client applies `call.timeout` *per `read`* on the response body rather than
+//! as one total budget. The send / await-response phase — the security-relevant
+//! one for write cancellation — is bounded by `call.timeout`. A trickling body,
+//! however, can hold the detached worker past `call.timeout`; that occupancy is
+//! bounded instead by [`LinearCall::max_response_bytes`] (total bytes) and the
+//! process-wide in-flight worker ceiling (ADR 0007 Decision 5, which fails closed
+//! with `rate-limited`). The endpoint is host-configured and allowlist-checked,
+//! not guest-chosen, so a trickle requires a compromised configured upstream and
+//! still degrades fail-closed.
 //!
 //! HTTP/2 is negotiated via ALPN (the `http2` cargo feature is re-enabled here
 //! because the workspace pin sets `default-features = false`), falling back to
@@ -28,16 +40,31 @@ use reqwest::blocking::{Client, Response};
 /// Synchronous reqwest transport for `host-linear`. Holds the operator's Linear
 /// API token; construct one per operator credential and hand it to a
 /// `LinearCapability`.
-#[derive(Debug)]
 pub struct ReqwestLinearTransport {
     token: String,
     client: Client,
+}
+
+// Manual `Debug` so the operator token can never reach a log line or panic
+// message through a `{:?}` on the transport — or on any struct that embeds it
+// and derives `Debug` (ADR 0006). The `LinearTransport` trait requires `Debug`;
+// this satisfies it without ever materialising the credential.
+impl std::fmt::Debug for ReqwestLinearTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReqwestLinearTransport")
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReqwestLinearTransport {
     /// Build a transport bound to `token`. The client carries no global timeout
     /// — each call's deadline comes from [`LinearCall::timeout`] and is applied
     /// per-request, so a single client serves calls with differing deadlines.
+    ///
+    /// Like [`LinearTransport::execute`], this uses `reqwest::blocking` and so
+    /// must not be called from within an async runtime (the production wiring
+    /// constructs it on the host, off any runtime).
     pub fn new(token: impl Into<String>) -> Result<Self, reqwest::Error> {
         let client = Client::builder().build()?;
         Ok(Self {
@@ -85,7 +112,9 @@ impl LinearTransport for ReqwestLinearTransport {
 
         let status = resp.status();
         // 429: surface the typed rate-limit variant with the parsed `Retry-After`
-        // (seconds) so the capability/orchestrator can branch on it.
+        // so the capability/orchestrator can branch on it. Only the integer-
+        // seconds form is parsed; the HTTP-date form degrades to `None` ("no
+        // hint"), matching `RateLimited(Option<u32>)`'s seconds-or-nothing shape.
         if status.as_u16() == 429 {
             let hint = resp
                 .headers()
@@ -224,6 +253,20 @@ mod tests {
             max_response_bytes,
             timeout,
         }
+    }
+
+    // ADR 0006: the operator token must never reach a log or panic. A `{:?}` on
+    // the transport must not render it. Guards the manual `Debug` impl — drop it
+    // (fall back to `#[derive(Debug)]`) and this fails.
+    #[test]
+    fn debug_redacts_the_operator_token() {
+        let transport = ReqwestLinearTransport::new("lr_live_SUPERSECRET").unwrap();
+        let rendered = format!("{transport:?}");
+        assert!(
+            !rendered.contains("lr_live_SUPERSECRET"),
+            "token leaked through Debug: {rendered}",
+        );
+        assert!(rendered.contains("redacted"), "got {rendered}");
     }
 
     #[test]
