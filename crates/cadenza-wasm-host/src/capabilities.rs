@@ -214,44 +214,82 @@ impl cadenza::runtime::host_linear::Host for StoreState {
             host_mode,
         );
         let duration_ms = started.elapsed().as_millis() as u64;
+        // The guest receives only the typed variant + a generic message; the
+        // detailed (scrubbed, capped) failure text stays host-side in the audit.
+        let (guest_result, audit_error) = match outcome {
+            Ok(resp) => (Ok(resp), None),
+            Err(failure) => (Err(failure.guest), Some(failure.audit_detail)),
+        };
         self.record_linear_audit(
             operation_name.as_deref(),
             &fingerprint,
             duration_ms,
             host_mode,
-            outcome.as_ref().err(),
+            audit_error.as_deref(),
         );
-        outcome
+        guest_result
+    }
+}
+
+/// Max bytes of failure detail retained in the audit log for a single
+/// `linear-graphql` call. The transport may include an arbitrarily large
+/// upstream body in its error string; capping before storage keeps a chatty
+/// failure from bloating the bounded log sink host-side.
+const MAX_AUDIT_ERROR_BYTES: usize = 512;
+
+/// A `linear-graphql` failure split into what the guest may see (`guest`: a
+/// typed variant with a *generic* message, never carrying upstream text or a
+/// token) and what is retained host-side for the audit (`audit_detail`:
+/// scrubbed + length-capped). Keeping these separate means the
+/// "token never reaches guest memory" guarantee does not depend on the caller
+/// having seeded the scrubber with the transport credential.
+struct LinearFailure {
+    guest: HostError,
+    audit_detail: String,
+}
+
+impl LinearFailure {
+    fn denied(message: &str) -> Self {
+        Self {
+            guest: HostError::Denied(message.to_string()),
+            audit_detail: format!("denied: {message}"),
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            audit_detail: format!("invalid-argument: {message}"),
+            guest: HostError::InvalidArgument(message),
+        }
     }
 }
 
 impl StoreState {
     /// Validate the call against host policy and hand it to the configured
-    /// transport. Returns the shared WIT error model; upstream/IO messages are
-    /// scrubbed before they cross back into guest memory.
+    /// transport. The error half is a [`LinearFailure`] so the caller can route
+    /// a generic message to the guest while auditing the detail host-side.
     fn dispatch_linear(
         &self,
         operation_name: Option<&str>,
         query: &str,
         variables_json: &str,
         mode: LinearMode,
-    ) -> Result<GraphqlResponse, HostError> {
+    ) -> Result<GraphqlResponse, LinearFailure> {
         let cap = self
             .caps
             .linear
             .as_ref()
-            .ok_or_else(|| HostError::Denied("linear capability not configured".to_string()))?;
+            .ok_or_else(|| LinearFailure::denied("linear capability not configured"))?;
         // Endpoint allowlist: the endpoint is host-configured (the guest never
         // supplies a URL); a misconfiguration fails closed.
         if !cap.endpoint_allowed() {
-            return Err(HostError::Denied(
-                "linear endpoint is not on the allowlist".to_string(),
+            return Err(LinearFailure::denied(
+                "linear endpoint is not on the allowlist",
             ));
         }
         if query.trim().is_empty() {
-            return Err(HostError::InvalidArgument(
-                "query must not be empty".to_string(),
-            ));
+            return Err(LinearFailure::invalid("query must not be empty"));
         }
         // Normalise/validate variables: empty means `{}`; anything present
         // must parse as a JSON *object* — GraphQL request variables are a
@@ -261,11 +299,11 @@ impl StoreState {
             "{}".to_string()
         } else {
             let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-                HostError::InvalidArgument(format!("variables-json is not valid JSON: {e}"))
+                LinearFailure::invalid(format!("variables-json is not valid JSON: {e}"))
             })?;
             if !parsed.is_object() {
-                return Err(HostError::InvalidArgument(
-                    "variables-json must be a JSON object".to_string(),
+                return Err(LinearFailure::invalid(
+                    "variables-json must be a JSON object",
                 ));
             }
             trimmed.to_string()
@@ -288,30 +326,62 @@ impl StoreState {
                 // memory. Bounding the host-side allocation itself is the
                 // transport's responsibility (see `LinearCall::max_response_bytes`).
                 if res.body_json.len() > self.http_body_limit {
-                    return Err(HostError::Upstream(format!(
-                        "linear response body exceeds the configured limit of {} bytes",
-                        self.http_body_limit
-                    )));
+                    return Err(LinearFailure {
+                        guest: HostError::Upstream("linear response body too large".to_string()),
+                        audit_detail: format!(
+                            "response body exceeds limit of {} bytes",
+                            self.http_body_limit
+                        ),
+                    });
                 }
                 Ok(GraphqlResponse {
                     status: res.status,
                     body_json: res.body_json,
                 })
             }
-            Err(err) => Err(map_linear_transport_error(err, &self.caps.scrubber)),
+            Err(err) => Err(self.map_transport_failure(err)),
+        }
+    }
+
+    /// Map a transport failure into a [`LinearFailure`]. The guest-facing error
+    /// carries a fixed, generic message — the upstream/IO text is **never**
+    /// forwarded to the guest, so an upstream that echoes the Authorization
+    /// token cannot leak it regardless of whether the scrubber was seeded. The
+    /// detail (scrubbed + capped) is kept only for the host-side audit.
+    fn map_transport_failure(&self, err: LinearTransportError) -> LinearFailure {
+        let detail = |kind: &str, msg: String| {
+            let scrubbed = self.caps.scrubber.scrub_text(&msg);
+            format!("{kind}: {}", truncate_for_audit(&scrubbed))
+        };
+        match err {
+            LinearTransportError::RateLimited(hint) => LinearFailure {
+                guest: HostError::RateLimited(hint),
+                audit_detail: match hint {
+                    Some(secs) => format!("rate-limited: retry after {secs}s"),
+                    None => "rate-limited".to_string(),
+                },
+            },
+            LinearTransportError::Upstream(msg) => LinearFailure {
+                guest: HostError::Upstream("linear upstream error".to_string()),
+                audit_detail: detail("upstream", msg),
+            },
+            LinearTransportError::Io(msg) => LinearFailure {
+                guest: HostError::Io("linear transport io error".to_string()),
+                audit_detail: detail("io", msg),
+            },
         }
     }
 
     /// Record one audit entry for a `linear-graphql` call. The raw query is
     /// never logged — only the fingerprint, operation name (scrubbed),
-    /// duration, mode, and (on failure) a scrubbed error.
+    /// duration, mode, and (on failure) the scrubbed + capped failure detail.
     fn record_linear_audit(
         &self,
         operation_name: Option<&str>,
         fingerprint: &str,
         duration_ms: u64,
         mode: LinearMode,
-        error: Option<&HostError>,
+        error_detail: Option<&str>,
     ) {
         use cadenza_obs::fields;
         let scrub = |s: &str| self.caps.scrubber.scrub_text(s);
@@ -335,10 +405,12 @@ impl StoreState {
             fields::FIELD_GRAPHQL_MODE.to_string(),
             serde_json::Value::String(mode.label().to_string()),
         );
-        if let Some(err) = error {
+        if let Some(detail) = error_detail {
+            // Defensive re-scrub: transport detail is already scrubbed, but
+            // locally-built denial/invalid messages pass through here too.
             map.insert(
                 fields::FIELD_ERROR.to_string(),
-                serde_json::Value::String(scrub(&host_error_message(err))),
+                serde_json::Value::String(scrub(detail)),
             );
         }
         let fields_json = serde_json::Value::Object(map).to_string();
@@ -352,38 +424,18 @@ impl StoreState {
     }
 }
 
-/// Map a transport failure onto the shared WIT `host-error`. Upstream/IO
-/// message strings are scrubbed so a token echoed by the upstream cannot leak
-/// to the guest. The rate-limit retry hint carries through untouched.
-fn map_linear_transport_error(
-    err: LinearTransportError,
-    scrubber: &cadenza_obs::Scrubber,
-) -> HostError {
-    match err {
-        LinearTransportError::RateLimited(hint) => HostError::RateLimited(hint),
-        LinearTransportError::Upstream(msg) => HostError::Upstream(scrubber.scrub_text(&msg)),
-        LinearTransportError::Io(msg) => HostError::Io(scrubber.scrub_text(&msg)),
+/// Truncate failure detail to [`MAX_AUDIT_ERROR_BYTES`] on a UTF-8 char
+/// boundary, appending an ellipsis marker when clipped, so a transport that
+/// stuffs a large upstream body into its error string cannot bloat the audit.
+fn truncate_for_audit(text: &str) -> String {
+    if text.len() <= MAX_AUDIT_ERROR_BYTES {
+        return text.to_string();
     }
-}
-
-/// Stable, dependency-free message extraction for the audit `error` field.
-/// The contained strings are already scrubbed by `map_linear_transport_error`
-/// for the transport paths; the audit then scrubs again defensively.
-fn host_error_message(err: &HostError) -> String {
-    match err {
-        HostError::Denied(m) => format!("denied: {m}"),
-        HostError::InvalidArgument(m) => format!("invalid-argument: {m}"),
-        HostError::NotFound(m) => format!("not-found: {m}"),
-        HostError::OutsideRoot => "outside-root".to_string(),
-        HostError::Timeout => "timeout".to_string(),
-        HostError::RateLimited(hint) => match hint {
-            Some(secs) => format!("rate-limited: retry after {secs}s"),
-            None => "rate-limited".to_string(),
-        },
-        HostError::Upstream(m) => format!("upstream: {m}"),
-        HostError::Io(m) => format!("io: {m}"),
-        HostError::Internal(m) => format!("internal: {m}"),
+    let mut end = MAX_AUDIT_ERROR_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
     }
+    format!("{}…[truncated]", &text[..end])
 }
 
 /// Non-cryptographic FNV-1a-64 fingerprint of a GraphQL query, hex-encoded.
@@ -1025,7 +1077,7 @@ mod tests {
             )
             .expect_err("oversized body must be rejected");
         assert!(
-            matches!(err, HostError::Upstream(ref m) if m.contains("exceeds")),
+            matches!(err, HostError::Upstream(ref m) if m.contains("too large")),
             "got {err:?}",
         );
     }
@@ -1102,16 +1154,17 @@ mod tests {
     }
 
     #[test]
-    fn linear_upstream_error_is_typed_and_scrubbed_before_guest() {
-        // The upstream echoes the host-only token in its error body. The error
-        // crosses back to the guest as a host-error — it MUST be scrubbed.
+    fn linear_upstream_error_never_forwards_text_to_guest() {
+        // The upstream echoes the host-only token in its error body AND the
+        // scrubber is EMPTY (caller forgot to seed it). The guest must still
+        // never see the token: the guest-facing error is a generic typed
+        // variant, so safety does not depend on scrubber seeding.
         let token = "lr_live_HOSTONLY";
         let transport = MockTransport::erroring(LinearTransportError::Upstream(format!(
             "unauthorized: token {token} rejected"
         )));
         let cap = LinearCapability::with_default_allowlist(transport);
-        let scrubber = Scrubber::with_secrets(vec![token.to_string()]);
-        let mut store = linear_store(Some(cap), scrubber);
+        let mut store = linear_store(Some(cap), Scrubber::empty());
 
         let err = store
             .data_mut()
@@ -1126,14 +1179,47 @@ mod tests {
             panic!("expected upstream, got {err:?}");
         };
         assert!(!msg.contains(token), "token leaked to guest: {msg}");
-        assert!(msg.contains("***REDACTED***"), "expected redaction: {msg}");
-
-        // The audit error field is scrubbed too.
-        let audit = last_audit(&store);
+        // The guest message is generic — it carries no upstream text at all.
         assert!(
-            !audit.fields_json.as_deref().unwrap().contains(token),
-            "token leaked into audit: {audit:?}",
+            !msg.contains("unauthorized"),
+            "upstream text leaked to guest: {msg}",
         );
+    }
+
+    #[test]
+    fn linear_upstream_error_detail_is_scrubbed_and_capped_in_audit() {
+        // A seeded scrubber redacts the token from the host-side audit detail,
+        // and an oversized upstream error string is capped so it cannot bloat
+        // the bounded log sink.
+        let token = "lr_live_HOSTONLY";
+        let big = format!("{token} {}", "A".repeat(4096));
+        let transport = MockTransport::erroring(LinearTransportError::Upstream(big));
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let scrubber = Scrubber::with_secrets(vec![token.to_string()]);
+        let mut store = linear_store(Some(cap), scrubber);
+
+        store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("upstream failure must surface");
+
+        let audit = last_audit(&store);
+        let fields = audit.fields_json.expect("audit fields");
+        assert!(!fields.contains(token), "token leaked into audit: {fields}");
+        // The detail is capped well below the 4 KiB upstream string.
+        let parsed: serde_json::Value = serde_json::from_str(&fields).unwrap();
+        let detail = parsed[cadenza_obs::fields::FIELD_ERROR].as_str().unwrap();
+        assert!(
+            detail.len() < 700,
+            "audit error detail not capped ({} bytes): {detail}",
+            detail.len(),
+        );
+        assert!(detail.contains("truncated"), "expected truncation marker");
     }
 
     #[test]

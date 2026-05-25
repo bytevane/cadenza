@@ -1,11 +1,12 @@
-//! End-to-end host-capability tests for issue #16.
+//! End-to-end host-capability tests for issues #16 and #17.
 //!
 //! These build the real example component (`cadenza-linear-graphql-plugin`)
-//! for `wasm32-wasip2`, link the four in-scope host functions, instantiate,
-//! and call `tool.run`. They cover the acceptance criteria: the example
-//! plugin logs and reads an allowed workspace file, an out-of-root read
-//! fails, `secret-exists` reports presence only, and host errors surface via
-//! the shared WIT `host-error` model.
+//! for `wasm32-wasip2`, link the host functions, instantiate, and call
+//! `tool.run`. They cover the acceptance criteria: the example plugin logs
+//! and reads an allowed workspace file, an out-of-root read fails,
+//! `secret-exists` reports presence only, a host-mediated `linear-graphql`
+//! call runs without leaking the token, and host errors surface via the
+//! shared WIT `host-error` model.
 //!
 //! The guest is built on demand (once) via a nested `cargo build`. The
 //! `wasm32-wasip2` target is a hard requirement (CI installs it); a missing
@@ -410,6 +411,41 @@ fn example_plugin_runs_allowed_linear_operation_without_leaking_token() {
     assert!(
         !fields.contains("viewer { id }"),
         "raw query text leaked into audit: {fields}",
+    );
+}
+
+#[test]
+fn example_plugin_passes_object_form_linear_variables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let loaded = load(&rt);
+    let transport = MockLinearTransport::new("tok", r#"{"data":{}}"#);
+    let caps = HostCapabilities {
+        clock: HostClock::Fixed(1),
+        linear: Some(LinearCapability::with_default_allowlist(transport.clone())),
+        ..Default::default()
+    };
+
+    run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        caps,
+        // Object form, not a string — must reach the host as object JSON, not {}.
+        serde_json::json!({
+            "linear_query": "query Q($first:Int){ issues(first:$first){ nodes { id } } }",
+            "linear_variables": { "first": 1 },
+        }),
+    )
+    .expect("guest run succeeds");
+
+    let calls = transport.seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let vars: serde_json::Value = serde_json::from_str(&calls[0].variables_json).unwrap();
+    assert_eq!(
+        vars["first"], 1,
+        "object variables were dropped: {:?}",
+        calls[0].variables_json
     );
 }
 

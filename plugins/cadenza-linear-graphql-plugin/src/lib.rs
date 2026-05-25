@@ -105,16 +105,21 @@ mod component {
                         .get("linear_operation")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    let variables = args
-                        .get("linear_variables")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    // Accept both the string form ("{\"first\":1}") and the
+                    // natural JSON-object form ({"first":1}); a non-string,
+                    // non-empty value is serialized so the host validates its
+                    // object-ness and fails fast rather than silently dropping it.
+                    let variables = match args.get("linear_variables") {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(other) => other.to_string(),
+                        None => String::new(),
+                    };
                     let mode = match args.get("linear_mode").and_then(|v| v.as_str()) {
                         Some("write") => GraphqlMode::Write,
                         _ => GraphqlMode::Read,
                     };
                     let response =
-                        linear_graphql(operation_name.as_deref(), query, variables, mode)?;
+                        linear_graphql(operation_name.as_deref(), query, &variables, mode)?;
                     Some(serde_json::json!({
                         "status": response.status,
                         "body_json": response.body_json,
