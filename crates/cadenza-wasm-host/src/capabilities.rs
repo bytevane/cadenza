@@ -9,8 +9,9 @@
 //!
 //! Security posture:
 //! - `workspace-read` resolves the guest path through the `cadenza-workspace`
-//!   containment APIs (lexical `safe_join` + symlink-aware
-//!   `canonicalize_inside`); escapes surface as `host-error::outside-root`.
+//!   containment APIs (lexical `safe_join` + symlink-aware `resolve_inside`,
+//!   whose resolved path is the one opened); escapes surface as
+//!   `host-error::outside-root`.
 //! - `secret-exists` answers from a presence-only name set; no value is ever
 //!   reachable through the WIT.
 //! - `log` redacts the message and fields with the shared `cadenza-obs`
@@ -542,9 +543,9 @@ mod tests {
     }
 
     // Guards the symlink half of containment specifically: lexical `safe_join`
-    // passes a symlink that lives inside the root, so only `canonicalize_inside`
-    // catches the escape. Removing that call makes this test read the outside
-    // target and fail.
+    // passes a symlink that lives inside the root, so only `resolve_inside`'s
+    // canonicalize catches the escape. Removing that call makes this test read
+    // the outside target and fail.
     #[cfg(unix)]
     #[test]
     fn read_workspace_rejects_symlink_escape() {
