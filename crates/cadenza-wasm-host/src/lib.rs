@@ -63,6 +63,17 @@ pub struct WasmRuntimeLimits {
     pub max_instances: usize,
     pub epoch_timeout_ms: u64,
     pub max_http_body_bytes: usize,
+    /// Wall-clock deadline (ms) for a single `host-linear` transport call.
+    /// `dispatch_linear` bounds `LinearTransport::execute` to this and fails
+    /// the call with `host-error::timeout` if the transport does not return in
+    /// time, so a slow/hung transport cannot block the host thread (ADR 0007).
+    /// Distinct from [`Self::epoch_timeout_ms`], which bounds *guest* CPU via
+    /// epoch interruption and cannot preempt a blocked host call.
+    ///
+    /// Defaulted in serde so a config predating the field still deserializes
+    /// (mirrors [`Self::max_table_elements`]).
+    #[serde(default = "default_linear_transport_timeout_ms")]
+    pub linear_transport_timeout_ms: u64,
 }
 
 impl Default for WasmRuntimeLimits {
@@ -74,6 +85,7 @@ impl Default for WasmRuntimeLimits {
             max_instances: 16,
             epoch_timeout_ms: 5_000,
             max_http_body_bytes: 2 * 1024 * 1024,
+            linear_transport_timeout_ms: default_linear_transport_timeout_ms(),
         }
     }
 }
@@ -86,6 +98,13 @@ impl Default for WasmRuntimeLimits {
 /// can reuse the same value.
 fn default_max_table_elements() -> usize {
     10_000
+}
+
+/// Default wall-clock deadline (ms) for a single host-linear transport call.
+/// 30 s is generous for a real network round-trip yet still bounds a hung
+/// upstream. Factored out so `#[serde(default = ...)]` reuses the same value.
+fn default_linear_transport_timeout_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +196,11 @@ pub struct StoreState {
     /// `host-linear` on the GraphQL response so an oversized upstream body
     /// cannot force a large host allocation or breach guest memory.
     http_body_limit: usize,
+    /// Wall-clock deadline for a single `host-linear` transport call
+    /// (`WasmRuntimeLimits::linear_transport_timeout_ms`). `dispatch_linear`
+    /// bounds `LinearTransport::execute` to this so a hung transport surfaces
+    /// `host-error::timeout` instead of pinning the host thread (ADR 0007).
+    linear_transport_timeout: Duration,
 }
 
 impl StoreState {
@@ -263,6 +287,11 @@ pub struct LinearCall {
     /// re-checks the returned body length as a backstop for the guest-memory
     /// boundary, but only the transport can bound its own allocation.
     pub max_response_bytes: usize,
+    /// Wall-clock deadline the host enforces on this call (ADR 0007). Carried
+    /// to the transport as defence-in-depth so the future real client can set
+    /// its own connect/read timeout from the same value the host watchdog
+    /// uses; the host bound does **not** depend on the transport honouring it.
+    pub timeout: Duration,
 }
 
 /// Raw transport result for a Linear GraphQL call. A completed HTTP exchange
@@ -815,6 +844,9 @@ impl ComponentRuntime {
             request,
             caps,
             http_body_limit: self.limits.max_http_body_bytes,
+            linear_transport_timeout: Duration::from_millis(
+                self.limits.linear_transport_timeout_ms,
+            ),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limiter);
@@ -1022,6 +1054,30 @@ mod tests {
             "missing field must default to the same value Default::default uses",
         );
         assert_eq!(limits.max_tables, 8);
+    }
+
+    #[test]
+    fn limits_deserialize_defaults_linear_transport_timeout() {
+        // ADR 0007: the host-linear watchdog deadline must round-trip from a
+        // config that predates the field, defaulting to the same value
+        // `Default::default` uses — so an old config never silently leaves the
+        // deadline zero/unset. Without `#[serde(default)]` this deserialize
+        // would fail outright.
+        let json = r#"{
+            "max_memory_bytes": 1024,
+            "max_tables": 8,
+            "max_instances": 4,
+            "epoch_timeout_ms": 100,
+            "max_http_body_bytes": 2048
+        }"#;
+        let limits: WasmRuntimeLimits =
+            serde_json::from_str(json).expect("legacy json deserializes");
+        assert_eq!(
+            limits.linear_transport_timeout_ms,
+            WasmRuntimeLimits::default().linear_transport_timeout_ms,
+            "missing field must default to the same value Default::default uses",
+        );
+        assert_eq!(limits.linear_transport_timeout_ms, 30_000);
     }
 
     #[test]
