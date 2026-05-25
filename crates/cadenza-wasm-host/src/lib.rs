@@ -490,10 +490,13 @@ const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(1);
 /// the invariant "while a `ComponentRuntime` is alive, its engine's epoch is
 /// being advanced" holds for the runtime's whole lifetime (issue #62).
 ///
-/// A guest can only execute via [`ComponentRuntime::run_tool`], which borrows
-/// `&self`, so the runtime — and therefore this ticker — is necessarily alive
-/// for the duration of any guest call. A store's epoch deadline is thus always
-/// backed by a live ticker while the guest is running.
+/// Guests are driven via [`ComponentRuntime::run_tool`], which borrows `&self`,
+/// so the runtime — and therefore this ticker — is necessarily alive for the
+/// duration of such a call, and the store's epoch deadline is backed by a live
+/// ticker. The stores returned by [`ComponentRuntime::new_store`] are owned
+/// values, not lifetime-bound to the runtime, so a caller that drives a store
+/// directly must keep the runtime alive for the deadline to fire — once the
+/// runtime is dropped the epoch stops advancing.
 struct EpochTicker {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,

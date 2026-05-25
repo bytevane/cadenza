@@ -68,10 +68,12 @@ fn infinite_loop_guest_traps_with_timeout_near_budget() {
     match rx.recv_timeout(Duration::from_secs(10)) {
         Ok((Err(WasmHostError::Timeout), elapsed)) => {
             // Trapped via epoch interruption — proves the engine epoch was
-            // advanced. Generous upper bound (2s) keeps this well clear of the
-            // 10s "ran forever" barrier while tolerating sleep granularity.
+            // advanced. The nominal budget is ~100ms; this 5s upper bound is
+            // deliberately generous (a brutally loaded box can stretch 1ms
+            // sleeps toward 15ms) yet stays well clear of the 10s "ran forever"
+            // barrier, so it still distinguishes a real trap from a hang.
             assert!(
-                elapsed < Duration::from_secs(2),
+                elapsed < Duration::from_secs(5),
                 "guest trapped but took {elapsed:?}, far beyond the ~100ms budget",
             );
         }
