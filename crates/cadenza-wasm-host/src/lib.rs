@@ -1,7 +1,9 @@
 //! Wasmtime component loader and resource-limit boundary for Cadenza.
 //!
 //! The host configures Wasmtime with explicit memory/table/instance
-//! caps and an epoch-based timeout. Components are loaded from disk
+//! caps and an epoch-based timeout; `ComponentRuntime` owns a background
+//! [`EpochTicker`] that advances the engine epoch so that timeout actually
+//! fires (issue #62). Components are loaded from disk
 //! via `ComponentRuntime::load`; the WIT package/world declared by
 //! the caller must match cadenza's frozen baseline (`WIT_PACKAGE` /
 //! `WIT_WORLD`) otherwise the loader fails closed.
@@ -18,8 +20,10 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cadenza_obs::Scrubber;
 use serde::{Deserialize, Serialize};
@@ -467,11 +471,79 @@ impl ResourceLimiter for RuntimeLimiter {
     }
 }
 
+/// Target interval between engine-epoch increments. Wasmtime epoch deadlines
+/// count engine-epoch increments, not wall-clock time, so a deadline of N ticks
+/// only approximates N milliseconds when ticks land ~1ms apart.
+///
+/// Cadence-vs-resolution tradeoff: a 1ms `thread::sleep` actually wakes every
+/// ~1-15ms on Linux/macOS, so each tick may represent more than 1ms of
+/// wall-clock. `epoch_timeout_ms` is therefore an approximate *floor* — a guest
+/// is guaranteed to trap, but the real elapsed time may exceed the configured
+/// budget by the scheduler's slack. That is acceptable: the invariant we need
+/// is "a runaway guest terminates", not "it terminates at exactly N ms". A
+/// higher-resolution timer is deliberately out of scope (issue #62).
+const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Background thread that advances a single [`Engine`]'s epoch counter on a
+/// fixed cadence so [`Store::set_epoch_deadline`] actually fires. Owned by
+/// [`ComponentRuntime`]; [`Drop`] signals the thread to stop and joins it, so
+/// the invariant "while a `ComponentRuntime` is alive, its engine's epoch is
+/// being advanced" holds for the runtime's whole lifetime (issue #62).
+///
+/// A guest can only execute via [`ComponentRuntime::run_tool`], which borrows
+/// `&self`, so the runtime — and therefore this ticker — is necessarily alive
+/// for the duration of any guest call. A store's epoch deadline is thus always
+/// backed by a live ticker while the guest is running.
+struct EpochTicker {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl EpochTicker {
+    /// Spawn a ticker advancing `engine`'s epoch every `interval`. The thread
+    /// owns its own `Engine` clone (engines are `Arc`-backed, so this is the
+    /// *same* epoch counter the runtime's stores observe).
+    fn spawn(engine: Engine, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_signal = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("cadenza-epoch-ticker".to_string())
+            .spawn(move || {
+                while !stop_signal.load(Ordering::Relaxed) {
+                    std::thread::sleep(interval);
+                    engine.increment_epoch();
+                }
+            })
+            .expect("spawn cadenza epoch ticker thread");
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            // The thread checks `stop` after at most one `interval` sleep, so
+            // this join blocks for at most that long.
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Wasmtime engine + reusable config. Cheap to clone; one per host
-/// process is typical, with per-load `Store` instances on top.
+/// process is typical, with per-load `Store` instances on top. Owns the
+/// [`EpochTicker`] that advances the engine epoch (issue #62) — dropping the
+/// runtime stops the ticker.
 pub struct ComponentRuntime {
     engine: Engine,
     limits: WasmRuntimeLimits,
+    // Dropped after `engine` by field order; its own `Engine` clone keeps the
+    // counter alive regardless. Held only for its `Drop` (stop + join), hence
+    // the leading underscore.
+    _ticker: EpochTicker,
 }
 
 impl ComponentRuntime {
@@ -481,7 +553,15 @@ impl ComponentRuntime {
         config.epoch_interruption(true);
         config.consume_fuel(false);
         let engine = Engine::new(&config).map_err(|e| WasmHostError::Engine(e.to_string()))?;
-        Ok(Self { engine, limits })
+        // Start advancing the epoch immediately so any store's deadline can
+        // fire. Without this, `set_epoch_deadline` never trips and a CPU-bound
+        // guest runs forever (issue #62).
+        let ticker = EpochTicker::spawn(engine.clone(), EPOCH_TICK_INTERVAL);
+        Ok(Self {
+            engine,
+            limits,
+            _ticker: ticker,
+        })
     }
 
     pub fn engine(&self) -> &Engine {
@@ -530,10 +610,10 @@ impl ComponentRuntime {
     }
 
     /// Build a fresh per-issue store with the runtime limiter and an
-    /// initial epoch deadline. The orchestrator advances the engine
-    /// epoch periodically (`Engine::increment_epoch`) — when the
-    /// deadline elapses without progress, Wasmtime traps the guest
-    /// and `WasmHostError::Timeout` is returned by the caller.
+    /// initial epoch deadline. The runtime's [`EpochTicker`] advances the
+    /// engine epoch on a fixed cadence (`Engine::increment_epoch`) — when the
+    /// deadline elapses, Wasmtime traps the guest and `WasmHostError::Timeout`
+    /// is returned by the caller.
     pub fn new_store(&self, request: RequestContext) -> Store<StoreState> {
         self.new_store_with(request, HostCapabilities::default())
     }
@@ -561,10 +641,10 @@ impl ComponentRuntime {
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limiter);
-        // Use the configured epoch budget (#48 P1). The orchestrator
-        // advances the engine epoch via `Engine::increment_epoch` at a
-        // fixed cadence (target: 1 tick per millisecond), so this
-        // deadline expressed in *ticks* approximates the budget in ms.
+        // Use the configured epoch budget (#48 P1). The runtime's
+        // `EpochTicker` advances the engine epoch via `Engine::increment_epoch`
+        // at a fixed cadence (`EPOCH_TICK_INTERVAL`, target 1 tick/ms), so this
+        // deadline expressed in *ticks* approximates the budget in ms (#62).
         // A zero or unconfigured budget falls back to 1 so an
         // unsupervised store still traps rather than running forever.
         store.set_epoch_deadline(self.epoch_budget_ticks());
