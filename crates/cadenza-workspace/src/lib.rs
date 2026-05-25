@@ -101,10 +101,13 @@ pub fn safe_join(root: &Utf8Path, segment: &str) -> Result<Utf8PathBuf, Workspac
     Ok(normalized)
 }
 
-/// Canonicalised containment check. Both `root` and `candidate` must
-/// exist on disk; symlinks are resolved before comparison so a symlink
-/// inside `root` that points to `/etc` will fail closed.
-pub fn canonicalize_inside(root: &Path, candidate: &Path) -> Result<(), WorkspaceError> {
+/// Canonicalised containment check that returns the resolved candidate path.
+/// Both `root` and `candidate` must exist on disk; symlinks are resolved
+/// before comparison so a symlink inside `root` that points to `/etc` fails
+/// closed. Callers that go on to open the file should open the **returned**
+/// path, not re-canonicalise `candidate`, so the validated path and the opened
+/// path cannot diverge under a concurrent symlink swap (check/use consistency).
+pub fn resolve_inside(root: &Path, candidate: &Path) -> Result<PathBuf, WorkspaceError> {
     let root_real = root
         .canonicalize()
         .map_err(|e| WorkspaceError::Canonicalize {
@@ -123,7 +126,15 @@ pub fn canonicalize_inside(root: &Path, candidate: &Path) -> Result<(), Workspac
             candidate: candidate_real.display().to_string(),
         });
     }
-    Ok(())
+    Ok(candidate_real)
+}
+
+/// Canonicalised containment check. Both `root` and `candidate` must
+/// exist on disk; symlinks are resolved before comparison so a symlink
+/// inside `root` that points to `/etc` will fail closed. Use
+/// [`resolve_inside`] instead when you will open the file afterwards.
+pub fn canonicalize_inside(root: &Path, candidate: &Path) -> Result<(), WorkspaceError> {
+    resolve_inside(root, candidate).map(|_| ())
 }
 
 /// PathBuf convenience wrapper around [`canonicalize_inside`].
@@ -322,6 +333,19 @@ mod tests {
         let child = root.join("issue");
         std::fs::create_dir(&child).unwrap();
         canonicalize_inside(root, &child).expect("real child is inside");
+    }
+
+    #[test]
+    fn resolve_inside_returns_canonical_child_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let child = root.join("issue");
+        std::fs::create_dir(&child).unwrap();
+        let resolved = resolve_inside(root, &child).expect("real child is inside");
+        // The returned path is canonical and inside the canonical root, so a
+        // caller opens exactly what was validated.
+        assert!(resolved.starts_with(root.canonicalize().unwrap()));
+        assert!(resolved.ends_with("issue"));
     }
 
     #[cfg(unix)]

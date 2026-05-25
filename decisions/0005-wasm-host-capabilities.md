@@ -49,11 +49,19 @@ blast radius:
    now uses `wit-bindgen` to generate `tool-runtime` guest bindings and
    implements `tool.run`, which calls exactly the four in-scope host
    functions. The regenerated `cadenza-linear-graphql-plugin.world.wit`
-   snapshot reflects that the example now *implements* the frozen world. This
-   is a materialization of an existing contract, **not** a host-ABI break:
-   the host package surface plugins compile against is unchanged. Per
-   `docs/operations/wit-abi-versioning.md` this is recorded here as
-   additive-only.
+   snapshot reflects that the example now *implements* the frozen world.
+
+   Reconciliation with `docs/operations/wit-abi-versioning.md`: that policy
+   versions the **host package WIT** (`wit/runtime.wit` / `abi/expected/
+   runtime.wit`). Those files are byte-identical in this PR — no interface,
+   function, or variant case was added — so the package version stays
+   `cadenza:runtime@0.2.0` and no minor/patch bump is due. The second
+   snapshot, `cadenza-linear-graphql-plugin.world.wit`, is a *separate
+   artifact*: the world extracted from the built example component. It changes
+   from the empty `world root {}` to a world that imports a **subset** of the
+   already-frozen host interfaces and exports `tool`. That is the example
+   conforming to the existing contract, not a change to the contract — hence
+   additive, no version bump, ADR-recorded.
 
 3. **Link only the four in-scope interfaces; trap everything else.** The
    `Linker` defines real implementations for `host-log`, `host-time`,
@@ -71,10 +79,17 @@ blast radius:
      value in tests) so the function is deterministic under test.
    - `workspace-read` resolves the guest-supplied path with
      `cadenza_workspace::safe_join` against the per-issue workspace root, then
-     `canonicalize_inside` for symlink safety. Containment escapes map to
-     `host-error::outside-root`; missing files to `not-found`; other IO to
-     `io`. `offset`/`limit` slice the bytes and set `truncated` when content
-     remains past the window.
+     `cadenza_workspace::resolve_inside` for symlink safety — which returns the
+     canonical path so the host opens exactly the path it validated (no second
+     canonicalisation that could diverge under a concurrent symlink swap).
+     Containment escapes map to `host-error::outside-root`; missing files to
+     `not-found`; other IO to `io`. The read seeks and reads only the
+     `offset`/`limit` window (hard-capped at 4 MiB when no `limit` is given) so
+     a small slice of a huge file never forces a whole-file host allocation;
+     `truncated` is set when content remains past the window.
+   - The captured host-call log sink is bounded (default 4096 records, with a
+     dropped counter) so a guest looping cheap imports cannot grow host memory
+     without bound before its epoch deadline.
    - `secret-exists` answers from a host-side set of configured secret
      *names*; no value is ever readable through the WIT (structurally
      enforced — there is no value-returning function).
@@ -93,6 +108,10 @@ blast radius:
 
 - `cadenza-wasm-host` gains a real `Linker`/instantiate/`run_tool` path and a
   dependency on `cadenza-workspace` and `cadenza-obs`.
+- `cadenza-workspace` gains an additive `resolve_inside` helper (same
+  containment semantics as `canonicalize_inside`, but returns the resolved
+  path so callers open exactly what was validated). `canonicalize_inside` now
+  delegates to it.
 - The example plugin gains a `wit-bindgen` dependency (pinned to
   `wasm.wit_bindgen_version` in `tools/versions.toml`) and is no longer a
   placeholder.

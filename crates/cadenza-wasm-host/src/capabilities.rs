@@ -208,19 +208,15 @@ fn read_workspace(
 
     // 1. Lexical containment: rejects absolute segments and `..` escapes.
     let candidate = cadenza_workspace::safe_join(root_utf8, &path).map_err(map_workspace_error)?;
-    // 2. Symlink-aware containment; a missing file surfaces here as not-found.
-    cadenza_workspace::canonicalize_inside(root.as_path(), candidate.as_std_path())
-        .map_err(map_workspace_error)?;
-    // 3. Read the *resolved* path, not the lexical one, so a symlink in an
-    //    intermediate path component cannot be swapped between the check above
-    //    and the read to escape the root. A residual race on the final
-    //    component is a known std limitation; a write-capable workspace API
+    // 2. Symlink-aware containment that returns the *resolved* path; a missing
+    //    file surfaces here as not-found. Opening this exact path (rather than
+    //    re-canonicalising `candidate`) keeps the validated path and the opened
+    //    path consistent under a concurrent symlink swap. A residual race on
+    //    the final component is a known std limitation; a write-capable API
     //    will need O_NOFOLLOW/openat2 (SECURITY.md) and is out of scope here.
-    let resolved = candidate
-        .as_std_path()
-        .canonicalize()
-        .map_err(map_io_error)?;
-    // 4. Read only the requested window (seek + bounded read), never the whole
+    let resolved = cadenza_workspace::resolve_inside(root.as_path(), candidate.as_std_path())
+        .map_err(map_workspace_error)?;
+    // 3. Read only the requested window (seek + bounded read), never the whole
     //    file: a guest asking for a tiny slice of a huge in-root file must not
     //    force the host to allocate the entire file. An unbounded request
     //    (`limit == None`) is hard-capped at `MAX_WORKSPACE_READ_BYTES`.
@@ -520,6 +516,29 @@ mod tests {
         assert_eq!(cadenza_obs::fields::FIELD_ISSUE_ID, "issue_id");
         assert_eq!(cadenza_obs::fields::FIELD_PLUGIN_NAME, "plugin_name");
         assert_eq!(cadenza_obs::fields::FIELD_COMPONENT, "component");
+    }
+
+    #[test]
+    fn classify_instantiate_maps_non_trap_to_link() {
+        let err = wasmtime::Error::msg("unknown import: missing");
+        assert!(matches!(classify_instantiate(err), WasmHostError::Link(_)));
+    }
+
+    #[test]
+    fn classify_instantiate_maps_interrupt_trap_to_timeout() {
+        // An epoch interruption during guest init must surface as Timeout, not
+        // as a linker wiring failure.
+        let err = wasmtime::Error::from(wasmtime::Trap::Interrupt);
+        assert!(matches!(classify_instantiate(err), WasmHostError::Timeout));
+    }
+
+    #[test]
+    fn classify_instantiate_maps_other_trap_to_limit_breached() {
+        let err = wasmtime::Error::from(wasmtime::Trap::UnreachableCodeReached);
+        assert!(matches!(
+            classify_instantiate(err),
+            WasmHostError::LimitBreached(_)
+        ));
     }
 
     // Guards the symlink half of containment specifically: lexical `safe_join`
