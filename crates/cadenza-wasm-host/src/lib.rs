@@ -6,15 +6,28 @@
 //! the caller must match cadenza's frozen baseline (`WIT_PACKAGE` /
 //! `WIT_WORLD`) otherwise the loader fails closed.
 //!
-//! Host capability functions live in a future PR (#16). For now the
-//! store carries a `RequestContext` placeholder and a `RuntimeLimiter`
-//! that Wasmtime consults during instantiation.
+//! Host capability functions (`host-log`, `host-time`, `host-workspace`,
+//! `host-secrets`) are implemented in [`capabilities`] and linked into the
+//! Wasmtime `Linker` by [`ComponentRuntime::run_tool`]. The store carries a
+//! [`RequestContext`] (issue/plugin identity + workspace root), a
+//! [`HostCapabilities`] bundle (configured secret names, redaction scrubber,
+//! clock, captured log sink) and the `RuntimeLimiter`. The guest's incidental
+//! WASI imports are stubbed as traps (not granted) during linking, so the
+//! only live capabilities are the four host functions — see ADR 0005.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use cadenza_obs::Scrubber;
 use serde::{Deserialize, Serialize};
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
+
+mod capabilities;
+
+pub use capabilities::{HostError, LogLevel, ToolInput, ToolOutput, WorkspaceReadResult};
 
 /// Frozen WIT identity of the cadenza host. Plugins must declare the
 /// same package and world in their `WasmComponentRef`. The ABI gate
@@ -60,6 +73,8 @@ pub enum WasmHostError {
     WitWorldMismatch { expected: String, actual: String },
     #[error("component denied by capability policy: {0}")]
     CapabilityDenied(String),
+    #[error("failed to wire host capabilities into the linker: {0}")]
+    Link(String),
     #[error("component file not found: {path}")]
     NotFound { path: PathBuf },
     #[error("component compile error: {0}")]
@@ -78,22 +93,163 @@ pub enum WasmHostError {
     },
 }
 
-/// Per-instance store payload. Currently just the resource limiter and
-/// a small request-context shell; host capability functions in #16
-/// will extend this with credentials, workspace handle, etc.
+/// Per-instance store payload read by the host capability functions in
+/// [`capabilities`]. Holds the resource limiter, the per-request identity and
+/// workspace root ([`RequestContext`]), and the host-side capability config
+/// ([`HostCapabilities`]). Workspace access is exclusively via
+/// `host-workspace`; the guest's incidental WASI imports are trapped, not
+/// granted (see [`ComponentRuntime::run_tool`]).
 pub struct StoreState {
     pub limiter: RuntimeLimiter,
     pub request: RequestContext,
+    caps: HostCapabilities,
 }
 
-/// Caller-supplied context the host functions read on each call. No
-/// raw secret material is allowed here — credentials live in the host
-/// and are referenced by id (see SECURITY.md). The placeholder fields
-/// here are documented at the type level.
+impl StoreState {
+    /// Read-only view of the configured host capabilities.
+    pub fn caps(&self) -> &HostCapabilities {
+        &self.caps
+    }
+
+    /// The captured structured-log sink. Each host call appends a
+    /// [`HostLogRecord`] carrying issue/plugin context; the `log` capability
+    /// additionally records the (redacted) level/message/fields.
+    pub fn log_sink(&self) -> &LogSink {
+        &self.caps.log_sink
+    }
+}
+
+/// Caller-supplied identity the host functions stamp onto every log record.
+/// No raw secret material is allowed here — credentials live in the host and
+/// `host-secrets` discloses only presence (see SECURITY.md). `workspace_path`
+/// is the containment root for `host-workspace.workspace-read`.
 #[derive(Debug, Default, Clone)]
 pub struct RequestContext {
     pub issue_id: Option<String>,
+    pub plugin_name: Option<String>,
     pub workspace_path: Option<PathBuf>,
+}
+
+/// Host-side capability configuration for a single guest invocation. None of
+/// these expose secret *values* to the guest: `secret_names` is presence-only
+/// metadata, and `scrubber` redacts secret-shaped material out of logs.
+#[derive(Debug, Default, Clone)]
+pub struct HostCapabilities {
+    /// Names of secrets the host considers present. `secret-exists` answers
+    /// from this set; the value is never stored here or disclosed.
+    pub secret_names: BTreeSet<String>,
+    /// Redaction applied to `host-log` messages and fields.
+    pub scrubber: Scrubber,
+    /// Clock backing `now-millis`; injectable so tests are deterministic.
+    pub clock: HostClock,
+    /// Structured-log capture for host calls.
+    pub log_sink: LogSink,
+}
+
+/// Clock source for `host-time.now-millis`. Defaults to the system clock;
+/// tests inject a fixed value for determinism.
+#[derive(Debug, Clone, Default)]
+pub enum HostClock {
+    #[default]
+    System,
+    Fixed(u64),
+}
+
+impl HostClock {
+    /// Milliseconds since the Unix epoch. A pre-epoch system clock clamps to
+    /// 0 rather than panicking.
+    pub fn now_millis(&self) -> u64 {
+        match self {
+            HostClock::System => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            HostClock::Fixed(v) => *v,
+        }
+    }
+}
+
+/// A single captured host-call log entry. Every host call records at least
+/// `op` + issue/plugin context; `host-log.log` also records the redacted
+/// level/message/fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLogRecord {
+    pub op: String,
+    pub issue_id: Option<String>,
+    pub plugin_name: Option<String>,
+    pub level: Option<String>,
+    pub message: Option<String>,
+    pub fields_json: Option<String>,
+}
+
+/// Default cap on captured [`HostLogRecord`]s. A guest can call host imports
+/// in a tight loop (e.g. `now-millis`) before its epoch deadline; without a
+/// cap the sink would grow unbounded host-side, bypassing guest memory limits
+/// and threatening host availability. Once the cap is hit, further records are
+/// counted in [`LogSink::dropped`] instead of stored.
+pub const DEFAULT_LOG_CAPACITY: usize = 4096;
+
+/// Cloneable, shareable, **bounded** capture of [`HostLogRecord`]s. Cheap to
+/// clone (the buffer is behind an `Arc<Mutex<…>>`), so a caller can hold a
+/// handle and inspect what the guest logged after `run_tool` returns. Bounded
+/// to `capacity` records to keep a chatty guest from exhausting host memory.
+#[derive(Debug, Clone)]
+pub struct LogSink {
+    inner: Arc<Mutex<LogSinkInner>>,
+}
+
+#[derive(Debug)]
+struct LogSinkInner {
+    records: Vec<HostLogRecord>,
+    dropped: u64,
+    capacity: usize,
+}
+
+impl Default for LogSink {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_LOG_CAPACITY)
+    }
+}
+
+impl LogSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sink that retains at most `capacity` records; further pushes are
+    /// counted in [`LogSink::dropped`].
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LogSinkInner {
+                records: Vec::new(),
+                dropped: 0,
+                capacity,
+            })),
+        }
+    }
+
+    /// Snapshot of the records captured so far (up to `capacity`).
+    pub fn records(&self) -> Vec<HostLogRecord> {
+        self.inner
+            .lock()
+            .expect("log sink mutex poisoned")
+            .records
+            .clone()
+    }
+
+    /// Count of records dropped after the capacity was reached.
+    pub fn dropped(&self) -> u64 {
+        self.inner.lock().expect("log sink mutex poisoned").dropped
+    }
+
+    pub(crate) fn push(&self, record: HostLogRecord) {
+        let mut inner = self.inner.lock().expect("log sink mutex poisoned");
+        if inner.records.len() >= inner.capacity {
+            inner.dropped = inner.dropped.saturating_add(1);
+            return;
+        }
+        inner.records.push(record);
+    }
 }
 
 /// Resource limiter Wasmtime consults during memory/table growth AND
@@ -247,6 +403,19 @@ impl ComponentRuntime {
     /// deadline elapses without progress, Wasmtime traps the guest
     /// and `WasmHostError::Timeout` is returned by the caller.
     pub fn new_store(&self, request: RequestContext) -> Store<StoreState> {
+        self.new_store_with(request, HostCapabilities::default())
+    }
+
+    /// Like [`ComponentRuntime::new_store`] but with explicit host
+    /// capabilities (configured secret names, redaction scrubber, clock, log
+    /// sink). The guest reaches the filesystem only through the contained
+    /// `host-workspace.workspace-read` capability; incidental WASI imports are
+    /// trapped during linking (see [`ComponentRuntime::run_tool`]).
+    pub fn new_store_with(
+        &self,
+        request: RequestContext,
+        caps: HostCapabilities,
+    ) -> Store<StoreState> {
         // `RuntimeLimiter` enforces memory/table growth (size) AND
         // the instance- and table-allocation caps (count) via its
         // `instances()` / `tables()` methods. There is no separate
@@ -255,6 +424,7 @@ impl ComponentRuntime {
         let state = StoreState {
             limiter: RuntimeLimiter::new(&self.limits),
             request,
+            caps,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limiter);
@@ -383,11 +553,13 @@ mod tests {
         let runtime = ComponentRuntime::new(WasmRuntimeLimits::default()).unwrap();
         let req = RequestContext {
             issue_id: Some("CAD-42".into()),
+            plugin_name: Some("example-plugin".into()),
             workspace_path: Some(PathBuf::from("/tmp/ws")),
         };
         let store = runtime.new_store(req.clone());
         let data = store.data();
         assert_eq!(data.request.issue_id.as_deref(), Some("CAD-42"));
+        assert_eq!(data.request.plugin_name.as_deref(), Some("example-plugin"));
         assert_eq!(data.request.workspace_path, Some(PathBuf::from("/tmp/ws")));
         assert_eq!(data.limiter.denied_growth(), 0);
         // Per #48 P2: the CUSTOM RuntimeLimiter must be the one wired
@@ -486,5 +658,24 @@ mod tests {
         // absent and the orchestrator passes credentials via host
         // functions that never copy raw values into guest memory.
         let _ = RequestContext::default();
+    }
+
+    #[test]
+    fn log_sink_is_bounded_and_counts_drops() {
+        // A chatty guest must not grow the sink without bound; past the
+        // capacity, records are dropped and counted instead of stored.
+        let sink = LogSink::with_capacity(2);
+        for _ in 0..5 {
+            sink.push(HostLogRecord {
+                op: "host-time.now-millis".to_string(),
+                issue_id: None,
+                plugin_name: None,
+                level: None,
+                message: None,
+                fields_json: None,
+            });
+        }
+        assert_eq!(sink.records().len(), 2);
+        assert_eq!(sink.dropped(), 3);
     }
 }

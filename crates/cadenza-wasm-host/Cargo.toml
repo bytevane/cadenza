@@ -8,7 +8,10 @@ repository.workspace = true
 
 [dependencies]
 camino.workspace = true
+cadenza-obs = { path = "../cadenza-obs" }
+cadenza-workspace = { path = "../cadenza-workspace" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wasmtime.workspace = true
