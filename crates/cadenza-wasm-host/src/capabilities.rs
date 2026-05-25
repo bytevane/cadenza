@@ -198,8 +198,8 @@ impl ComponentRuntime {
         // surfaces as the precise `LimitBreached` rather than the stringly-typed
         // wasmtime count error that `classify_instantiate` could only label
         // `Link` (issue #82). The caps are read from the very `RuntimeLimiter`
-        // wasmtime enforces against, so this never diverges from wasmtime's own
-        // check — it just runs first with a typed cause.
+        // wasmtime enforces against, so for this fresh store it mirrors
+        // wasmtime's own boundary — it just runs first with a typed cause.
         let (table_cap, memory_cap) = {
             let limiter = &store.data().limiter;
             (
@@ -852,9 +852,22 @@ pub(crate) fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
 /// [`wasmtime::component::Component::resources_required`] summary — *not* an
 /// error-message substring (issue #82 AC2). `table_cap` / `memory_cap` are the
 /// same values wasmtime reads from the store's `RuntimeLimiter`
-/// (`ResourceLimiter::tables` / `memories`), so this check can never diverge
-/// from wasmtime's own enforcement: it runs first only to attach a typed cause,
-/// and wasmtime keeps enforcing the identical caps as a fail-closed backstop.
+/// (`ResourceLimiter::tables` / `memories`), so for a freshly-instantiated store
+/// this check mirrors wasmtime's own boundary exactly — it runs first only to
+/// attach a typed cause, with wasmtime enforcing the identical caps as a
+/// fail-closed backstop. (Were a store reused across instantiations, wasmtime's
+/// counts accumulate while this per-component check does not; an accumulated
+/// breach then still fails closed via wasmtime, surfacing as `Link` — the same
+/// residual as the instance case below.)
+///
+/// Which caps actually bind: cadenza configures explicit *count* caps for tables
+/// (`max_tables`) and instances (`max_instances`) only. It bounds memory by
+/// *size* (`max_memory_bytes`, via `RuntimeLimiter::memory_growing`), not by
+/// count, and does not override `ResourceLimiter::memories`, so `memory_cap` here
+/// is wasmtime's built-in default (10_000). The memory branch therefore
+/// classifies a breach of that default count cap — no real plugin approaches it,
+/// but a component declaring an absurd number of memories is then labelled
+/// precisely instead of as `Link`.
 ///
 /// `resources_required` returns `None` when the component imports core modules
 /// or instances (its resource needs are then not statically knowable); cadenza's
@@ -1177,11 +1190,21 @@ mod tests {
         );
     }
 
-    // Issue #82, memory counterpart: a component declaring more *memories* than
-    // the host count cap is rejected before instantiation as `LimitBreached`.
+    // Issue #82, memory counterpart: the pre-check's memory branch classifies an
+    // over-count as `LimitBreached`. Unlike tables, cadenza configures no memory
+    // *count* cap — it bounds memory by *size* (`max_memory_bytes`) and does not
+    // override `ResourceLimiter::memories`, so in production the memory-count cap
+    // is wasmtime's large built-in default that no real component approaches.
+    // Pin that default first (so this test cannot be silently read as proving a
+    // tight production cap), then exercise the branch directly with a low cap.
     // The table cap is left roomy so only the memory branch can fire.
     #[test]
     fn declared_memory_count_over_cap_surfaces_as_limit_breached() {
+        let limiter = crate::RuntimeLimiter::new(&crate::WasmRuntimeLimits::default());
+        assert!(
+            ResourceLimiter::memories(&limiter) >= 10_000,
+            "production memory-count cap is wasmtime's large default, not a tight cap",
+        );
         let component = wat_component(
             r#"
             (component
