@@ -128,3 +128,10 @@ consumer and is not part of the contract registry, the Codex schema, or
   scope here per the issue's non-goals, and tracked as a follow-up. The
   in-flight ceiling (Decision 5) bounds how many such writes can be in flight
   at once but does not make a single one cancellable.
+
+  **Resolved by ADR 0008** (issue #84): the production `reqwest` transport sets
+  its own per-request deadline from `LinearCall::timeout`, so a timed-out call is
+  actively cancelled at the transport layer (connection dropped / HTTP/2 stream
+  reset) and the worker is reclaimed promptly. Exactly-once for writes is still
+  not a client guarantee — non-idempotent mutations require caller-side
+  idempotency — but the silently-leaked in-flight request is gone.

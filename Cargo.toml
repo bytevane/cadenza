@@ -9,6 +9,7 @@ members = [
   "crates/cadenza-codex",
   "crates/cadenza-tracker-linear",
   "crates/cadenza-wasm-host",
+  "crates/cadenza-host-linear-http",
   "crates/cadenza-obs",
   "plugins/cadenza-linear-graphql-plugin",
 ]
