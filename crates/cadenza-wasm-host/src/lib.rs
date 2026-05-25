@@ -54,6 +54,11 @@ pub struct WasmRuntimeLimits {
     /// function table can carry hundreds of entries, so this default must be
     /// roomier than [`Self::max_tables`] for a genuine component to
     /// instantiate (issue #74).
+    ///
+    /// Defaulted in serde so an existing config that predates the field
+    /// continues to deserialize — making the wire shape backwards-compatible
+    /// even though no in-tree consumer deserializes `WasmRuntimeLimits` yet.
+    #[serde(default = "default_max_table_elements")]
     pub max_table_elements: usize,
     pub max_instances: usize,
     pub epoch_timeout_ms: u64,
@@ -65,16 +70,22 @@ impl Default for WasmRuntimeLimits {
         Self {
             max_memory_bytes: 64 * 1024 * 1024,
             max_tables: 64,
-            // Generous enough that a real `wasm32-wasip2` component
-            // instantiates under the default — its function table can carry
-            // ~hundreds of entries, and the previous conflation with
-            // `max_tables = 64` denied instantiation outright (issue #74).
-            max_table_elements: 10_000,
+            max_table_elements: default_max_table_elements(),
             max_instances: 16,
             epoch_timeout_ms: 5_000,
             max_http_body_bytes: 2 * 1024 * 1024,
         }
     }
+}
+
+/// Default per-table element cap. Generous enough that a real
+/// `wasm32-wasip2` component instantiates under the default — its function
+/// table can carry hundreds of entries, and the previous conflation with
+/// `max_tables = 64` denied instantiation outright (issue #74). Factored out
+/// so `#[serde(default = ...)]` on `WasmRuntimeLimits::max_table_elements`
+/// can reuse the same value.
+fn default_max_table_elements() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -860,6 +871,29 @@ mod tests {
         };
         let limiter = RuntimeLimiter::new(&limits);
         assert_eq!(ResourceLimiter::tables(&limiter), 5);
+    }
+
+    #[test]
+    fn limits_deserialize_tolerates_missing_max_table_elements() {
+        // Issue #74: the new `max_table_elements` field must round-trip from
+        // a config that predates it. Without `#[serde(default)]`, an old
+        // config omitting the field would fail to deserialize. The default
+        // must agree with `Default::default()` so callers see one value.
+        let json = r#"{
+            "max_memory_bytes": 1024,
+            "max_tables": 8,
+            "max_instances": 4,
+            "epoch_timeout_ms": 100,
+            "max_http_body_bytes": 2048
+        }"#;
+        let limits: WasmRuntimeLimits =
+            serde_json::from_str(json).expect("legacy json deserializes");
+        assert_eq!(
+            limits.max_table_elements,
+            WasmRuntimeLimits::default().max_table_elements,
+            "missing field must default to the same value Default::default uses",
+        );
+        assert_eq!(limits.max_tables, 8);
     }
 
     #[test]
