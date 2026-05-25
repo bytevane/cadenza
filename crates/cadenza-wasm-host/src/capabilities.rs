@@ -76,6 +76,14 @@ impl ComponentRuntime {
         loaded: &LoadedComponent,
         input: ToolInput,
     ) -> Result<Result<ToolOutput, HostError>, WasmHostError> {
+        // Re-arm the epoch deadline at execution time. The deadline set in
+        // `new_store` is relative to the engine epoch *then*, but the runtime's
+        // ticker advances the epoch continuously — so any gap between
+        // `new_store` and this call (or reuse of the store for another call)
+        // could leave the budget already spent and trap immediately. Re-arming
+        // here makes the budget measure this invocation's execution, not the
+        // store's age (issue #62 review follow-up).
+        store.set_epoch_deadline(self.epoch_budget_ticks());
         let mut linker = Linker::<StoreState>::new(self.engine());
         // Stub *every* import as a trap first, then shadow the in-scope host
         // interfaces with their real implementations. The guest's incidental
