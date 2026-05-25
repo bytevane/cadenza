@@ -70,6 +70,44 @@ pub struct WasmComponentRef {
     pub wit_world: String,
 }
 
+/// Typed signal that the `RuntimeLimiter` denied an allocation that
+/// `Wasmtime` consulted it about. Returned from `memory_growing` /
+/// `table_growing` as the inner payload of a `wasmtime::Error` so the host can
+/// downcast at `classify_instantiate`/`classify_trap` time and surface
+/// `WasmHostError::LimitBreached` instead of the less-precise `Link`
+/// classification a plain string error would land on (issue #75).
+///
+/// This carries the (current, desired, cap) triple so a future audit log can
+/// record the precise growth attempt that tripped the cap. The trait method
+/// can only signal denial-or-not (no `format!` payload), so a typed struct is
+/// the only non-string-matching channel for the cause.
+#[derive(Debug, thiserror::Error)]
+#[error("guest cap breached: {kind} growth from {current} to {desired} denied (host cap {cap})")]
+pub(crate) struct ResourceLimitBreached {
+    pub kind: &'static str,
+    pub current: usize,
+    pub desired: usize,
+    pub cap: usize,
+}
+
+/// Typed signal that the guest invoked an import the host did not link — i.e.
+/// a deferred capability such as `host-http` / `host-tools` (and any future
+/// interface not yet wired in `add_host_capabilities`). Returned by the
+/// per-import stub installed by [`define_imports_as_capability_denied`] as the
+/// inner payload of a `wasmtime::Error` so `classify_trap` can downcast and
+/// surface `WasmHostError::CapabilityDenied` instead of the less-precise
+/// `LimitBreached` a generic trap would land on (issue #75).
+///
+/// `interface` is the WIT instance name (e.g. `cadenza:runtime/host-http`)
+/// and `item` is the function name within it — together they form the path the
+/// audit log records when a denial is surfaced.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("capability denied: deferred host import `{interface}#{item}`")]
+pub(crate) struct DeferredCapability {
+    pub interface: String,
+    pub item: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WasmHostError {
     #[error("component WIT package mismatch: expected {expected}, actual {actual}")]
@@ -428,28 +466,46 @@ impl RuntimeLimiter {
 }
 
 impl ResourceLimiter for RuntimeLimiter {
+    /// Denials surface as a typed `Err(ResourceLimitBreached)` rather than
+    /// `Ok(false)` so the host can downcast at `classify_instantiate` /
+    /// `classify_trap` time and label the error as `LimitBreached` instead of
+    /// the less-precise `Link` (issue #75). Per the `ResourceLimiter` contract,
+    /// an `Err` return also turns a runtime `memory.grow` into a trap rather
+    /// than a `-1` return — that is a deliberate fail-closed hardening: a
+    /// guest exceeding the host's cap MUST be visible to the host, not a soft
+    /// failure the guest silently routes around.
     fn memory_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         if desired > self.max_memory_bytes {
             self.denied_growth = self.denied_growth.saturating_add(1);
-            return Ok(false);
+            return Err(wasmtime::Error::new(ResourceLimitBreached {
+                kind: "memory",
+                current,
+                desired,
+                cap: self.max_memory_bytes,
+            }));
         }
         Ok(true)
     }
 
     fn table_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         if desired > self.max_tables {
             self.denied_growth = self.denied_growth.saturating_add(1);
-            return Ok(false);
+            return Err(wasmtime::Error::new(ResourceLimitBreached {
+                kind: "table",
+                current,
+                desired,
+                cap: self.max_tables,
+            }));
         }
         Ok(true)
     }
@@ -689,11 +745,16 @@ impl std::fmt::Debug for LoadedComponent {
     }
 }
 
-/// Helper for converting a wasmtime trap into our typed timeout when
-/// the trap kind was an epoch interruption. Other trap kinds map to
-/// `LimitBreached` so the orchestrator can branch on the cause.
+/// Convert a wasmtime call-time error into our typed host error. Precedence:
+/// a `DeferredCapability` payload (the typed signal a deferred-import stub
+/// emits) surfaces as `CapabilityDenied`; an epoch interruption surfaces as
+/// `Timeout`; any other trap or non-trap call-time failure collapses to
+/// `LimitBreached` so the orchestrator can branch on the cause (issue #75).
 pub fn classify_trap(err: wasmtime::Error) -> WasmHostError {
     use wasmtime::Trap;
+    if let Some(denial) = err.downcast_ref::<DeferredCapability>() {
+        return WasmHostError::CapabilityDenied(denial.to_string());
+    }
     if let Some(trap) = err.downcast_ref::<Trap>() {
         if matches!(*trap, Trap::Interrupt) {
             return WasmHostError::Timeout;
@@ -851,6 +912,8 @@ mod tests {
 
     #[test]
     fn limiter_allows_at_cap_and_denies_above_cap() {
+        // Paired-edge: exact-cap requests pass with `Ok(true)`; any byte over
+        // surfaces a typed denial that classify_instantiate downcasts (#75).
         let limits = WasmRuntimeLimits {
             max_memory_bytes: 1_024,
             ..Default::default()
@@ -858,19 +921,26 @@ mod tests {
         let mut limiter = RuntimeLimiter::new(&limits);
         assert!(limiter.memory_growing(0, 1_024, None).unwrap());
         assert_eq!(limiter.denied_growth(), 0);
-        assert!(!limiter.memory_growing(0, 1_025, None).unwrap());
+        let err = limiter
+            .memory_growing(0, 1_025, None)
+            .expect_err("over-cap must error, not Ok(false)");
+        assert!(err.downcast_ref::<ResourceLimitBreached>().is_some());
         assert_eq!(limiter.denied_growth(), 1);
     }
 
     #[test]
     fn limiter_table_cap_paired_edges() {
+        // Paired-edge mirror of the memory test for the table cap (#75).
         let limits = WasmRuntimeLimits {
             max_tables: 4,
             ..Default::default()
         };
         let mut limiter = RuntimeLimiter::new(&limits);
         assert!(limiter.table_growing(0, 4, None).unwrap());
-        assert!(!limiter.table_growing(0, 5, None).unwrap());
+        let err = limiter
+            .table_growing(0, 5, None)
+            .expect_err("over-cap must error, not Ok(false)");
+        assert!(err.downcast_ref::<ResourceLimitBreached>().is_some());
         assert_eq!(limiter.denied_growth(), 1);
     }
 
@@ -881,6 +951,87 @@ mod tests {
         // absent and the orchestrator passes credentials via host
         // functions that never copy raw values into guest memory.
         let _ = RequestContext::default();
+    }
+
+    // issue #75: instantiation-time resource-limit breaches must surface as
+    // `LimitBreached`, not the less-precise `Link`. The limiter signals denial
+    // via a typed `ResourceLimitBreached` payload inside `wasmtime::Error`;
+    // `classify_instantiate` must downcast that payload.
+    #[test]
+    fn classify_instantiate_maps_typed_limit_breach_to_limit_breached() {
+        let err = wasmtime::Error::new(ResourceLimitBreached {
+            kind: "memory",
+            current: 0,
+            desired: 1_048_576,
+            cap: 1_024,
+        });
+        let classified = crate::capabilities::classify_instantiate(err);
+        assert!(
+            matches!(classified, WasmHostError::LimitBreached(_)),
+            "got {classified:?}",
+        );
+    }
+
+    // issue #75: a guest call into a deferred (not-linked) host import must
+    // surface as `CapabilityDenied`, not `LimitBreached`. The unknown-import
+    // stub signals the denial via a typed `DeferredCapability` payload inside
+    // `wasmtime::Error`; `classify_trap` must downcast that payload.
+    #[test]
+    fn classify_trap_maps_typed_deferred_capability_to_capability_denied() {
+        let err = wasmtime::Error::new(DeferredCapability {
+            interface: "cadenza:runtime/host-http".to_string(),
+            item: "fetch".to_string(),
+        });
+        let classified = classify_trap(err);
+        assert!(
+            matches!(classified, WasmHostError::CapabilityDenied(_)),
+            "got {classified:?}",
+        );
+    }
+
+    // issue #75: when wasmtime asks the limiter to authorize a growth that
+    // exceeds our cap, we MUST return a typed `Err(ResourceLimitBreached)`
+    // rather than `Ok(false)`. This is the signal `classify_instantiate`
+    // downcasts on; without it the path lands on `Link` (issue #75 case 1).
+    #[test]
+    fn limiter_returns_typed_error_when_memory_cap_exceeded() {
+        let limits = WasmRuntimeLimits {
+            max_memory_bytes: 1_024,
+            ..Default::default()
+        };
+        let mut limiter = RuntimeLimiter::new(&limits);
+        let err = limiter
+            .memory_growing(0, 1_025, None)
+            .expect_err("over-cap memory growth must surface a typed error");
+        let signal = err
+            .downcast_ref::<ResourceLimitBreached>()
+            .expect("error must carry a ResourceLimitBreached payload");
+        assert_eq!(signal.kind, "memory");
+        assert_eq!(signal.desired, 1_025);
+        assert_eq!(signal.cap, 1_024);
+        // The denied_growth counter remains useful observability — it must
+        // still tick on each denial so an operator can audit aggregate
+        // pressure even when individual breaches surface upstream.
+        assert_eq!(limiter.denied_growth(), 1);
+    }
+
+    #[test]
+    fn limiter_returns_typed_error_when_table_cap_exceeded() {
+        let limits = WasmRuntimeLimits {
+            max_tables: 4,
+            ..Default::default()
+        };
+        let mut limiter = RuntimeLimiter::new(&limits);
+        let err = limiter
+            .table_growing(0, 5, None)
+            .expect_err("over-cap table growth must surface a typed error");
+        let signal = err
+            .downcast_ref::<ResourceLimitBreached>()
+            .expect("error must carry a ResourceLimitBreached payload");
+        assert_eq!(signal.kind, "table");
+        assert_eq!(signal.desired, 5);
+        assert_eq!(signal.cap, 4);
+        assert_eq!(limiter.denied_growth(), 1);
     }
 
     #[test]
