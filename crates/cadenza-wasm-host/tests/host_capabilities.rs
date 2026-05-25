@@ -20,7 +20,7 @@ use cadenza_obs::Scrubber;
 use cadenza_wasm_host::{
     ComponentRuntime, HostCapabilities, HostClock, HostError, LinearCall, LinearCapability,
     LinearHttpResult, LinearTransport, LinearTransportError, LogSink, RequestContext, ToolInput,
-    ToolOutput, WIT_PACKAGE, WIT_WORLD, WasmComponentRef, WasmRuntimeLimits,
+    ToolOutput, WIT_PACKAGE, WIT_WORLD, WasmComponentRef, WasmHostError, WasmRuntimeLimits,
 };
 
 /// Host-side mock transport for the `host-linear` integration tests. It is the
@@ -496,4 +496,42 @@ fn read_limit_truncates() {
     let summary: serde_json::Value = serde_json::from_str(&out.result_json).unwrap();
     assert_eq!(summary["read"]["text"], "0123");
     assert_eq!(summary["read"]["truncated"], true);
+}
+
+/// End-to-end proof for issue #75 case 1: a real component whose declared
+/// minimum memory exceeds the host's per-store cap must surface as
+/// `WasmHostError::LimitBreached` at `run_tool` time, NOT `Link`.
+///
+/// The `RuntimeLimiter` signals denial via a typed `ResourceLimitBreached`
+/// payload inside `wasmtime::Error`; wasmtime propagates it through
+/// `ToolRuntime::instantiate`; `classify_instantiate` downcasts it. The
+/// previous classification (`Link`) was misleading — callers wishing to
+/// branch on "the guest tripped a host cap" vs "wiring is broken" had no
+/// reliable signal. This test guards the propagation chain end to end.
+#[test]
+fn instantiation_resource_limit_breach_surfaces_as_limit_breached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let limits = WasmRuntimeLimits {
+        // 4 KiB is well below the example plugin's declared minimum memory
+        // (the Rust std runtime needs at least a few pages just to start), so
+        // wasmtime will consult the limiter at instantiate time and our
+        // `memory_growing` callback will deny it with the typed signal.
+        max_memory_bytes: 4 * 1024,
+        max_tables: 10_000,
+        ..Default::default()
+    };
+    let rt = ComponentRuntime::new(limits).expect("engine init");
+    let loaded = load(&rt);
+    let mut store = rt.new_store_with(request_in(tmp.path()), HostCapabilities::default());
+    let input = ToolInput {
+        name: "demo".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let err = rt
+        .run_tool(&mut store, &loaded, input)
+        .expect_err("instantiation with a 4 KiB memory cap must fail");
+    assert!(
+        matches!(err, WasmHostError::LimitBreached(_)),
+        "issue #75 case 1: over-cap instantiation must classify as LimitBreached, got {err:?}",
+    );
 }
