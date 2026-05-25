@@ -319,6 +319,17 @@ pub enum LinearTransportError {
 /// credentials and perform the HTTP request; the credential is never exposed
 /// to the guest. Injectable so tests drive a mock without a live server
 /// (mirrors [`HostClock`] and `cadenza_tracker_linear::LinearTransport`).
+///
+/// **Cancellation contract (ADR 0008).** An implementation that performs real
+/// network I/O MUST set its own request deadline from [`LinearCall::timeout`] so
+/// the request is *aborted* at the transport layer when the deadline elapses
+/// (the connection dropped / the HTTP/2 stream reset), rather than left running.
+/// The host's wall-clock watchdog ([`StoreState::execute_within_deadline`], ADR
+/// 0007) frees the host thread but cannot interrupt a blocking call; only the
+/// transport's own deadline can stop the upstream request and let the detached
+/// worker be reclaimed promptly. Exactly-once for `GraphqlMode::Write` is still
+/// not guaranteed across a timeout — a server may have committed before the
+/// abort — so non-idempotent mutations require caller-side idempotency.
 pub trait LinearTransport: Send + Sync + std::fmt::Debug {
     fn execute(&self, call: LinearCall) -> Result<LinearHttpResult, LinearTransportError>;
 }

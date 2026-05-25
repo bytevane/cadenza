@@ -255,6 +255,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cadenza-host-linear-http"
+version = "0.1.0"
+dependencies = [
+ "cadenza-wasm-host",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
 name = "cadenza-linear-graphql-plugin"
 version = "0.1.0"
 dependencies = [
@@ -1966,7 +1975,10 @@ checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
