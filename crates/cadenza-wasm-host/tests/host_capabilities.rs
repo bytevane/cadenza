@@ -1,11 +1,12 @@
-//! End-to-end host-capability tests for issue #16.
+//! End-to-end host-capability tests for issues #16 and #17.
 //!
 //! These build the real example component (`cadenza-linear-graphql-plugin`)
-//! for `wasm32-wasip2`, link the four in-scope host functions, instantiate,
-//! and call `tool.run`. They cover the acceptance criteria: the example
-//! plugin logs and reads an allowed workspace file, an out-of-root read
-//! fails, `secret-exists` reports presence only, and host errors surface via
-//! the shared WIT `host-error` model.
+//! for `wasm32-wasip2`, link the host functions, instantiate, and call
+//! `tool.run`. They cover the acceptance criteria: the example plugin logs
+//! and reads an allowed workspace file, an out-of-root read fails,
+//! `secret-exists` reports presence only, a host-mediated `linear-graphql`
+//! call runs without leaking the token, and host errors surface via the
+//! shared WIT `host-error` model.
 //!
 //! The guest is built on demand (once) via a nested `cargo build`. The
 //! `wasm32-wasip2` target is a hard requirement (CI installs it); a missing
@@ -13,13 +14,47 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cadenza_obs::Scrubber;
 use cadenza_wasm_host::{
-    ComponentRuntime, HostCapabilities, HostClock, HostError, LogSink, RequestContext, ToolInput,
+    ComponentRuntime, HostCapabilities, HostClock, HostError, LinearCall, LinearCapability,
+    LinearHttpResult, LinearTransport, LinearTransportError, LogSink, RequestContext, ToolInput,
     ToolOutput, WIT_PACKAGE, WIT_WORLD, WasmComponentRef, WasmRuntimeLimits,
 };
+
+/// Host-side mock transport for the `host-linear` integration tests. It is the
+/// sole injector of the Linear credential — the guest never supplies one — and
+/// records the calls it received so a test can assert the host-normalised
+/// request. The `token` models a credential that must stay host-side.
+#[derive(Debug)]
+struct MockLinearTransport {
+    token: String,
+    body_json: String,
+    seen: Mutex<Vec<LinearCall>>,
+}
+
+impl MockLinearTransport {
+    fn new(token: &str, body_json: &str) -> Arc<Self> {
+        Arc::new(Self {
+            token: token.to_string(),
+            body_json: body_json.to_string(),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl LinearTransport for MockLinearTransport {
+    fn execute(&self, call: LinearCall) -> Result<LinearHttpResult, LinearTransportError> {
+        // Auth is injected here, host-side; the token never crosses to guest.
+        let _auth = format!("Authorization: Bearer {}", self.token);
+        self.seen.lock().unwrap().push(call);
+        Ok(LinearHttpResult {
+            status: 200,
+            body_json: self.body_json.clone(),
+        })
+    }
+}
 
 /// Build the example plugin once and cache the resulting `.wasm` path.
 fn plugin_component() -> &'static PathBuf {
@@ -135,6 +170,7 @@ fn example_plugin_logs_and_reads_allowed_file() {
         scrubber: Scrubber::empty(),
         clock: HostClock::Fixed(1_234),
         log_sink: log_sink.clone(),
+        linear: None,
     };
 
     let out = run(
@@ -301,6 +337,141 @@ fn log_redacts_registered_secret_value_in_message() {
     assert!(
         message.contains("***REDACTED***"),
         "expected redaction marker in {message}",
+    );
+}
+
+#[test]
+fn example_plugin_runs_allowed_linear_operation_without_leaking_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let loaded = load(&rt);
+
+    let token = "lr_live_HOSTONLY_TOKEN";
+    let transport = MockLinearTransport::new(token, r#"{"data":{"viewer":{"id":"u_42"}}}"#);
+    let log_sink = LogSink::new();
+    let caps = HostCapabilities {
+        // The scrubber knows the host token so any accidental echo is redacted.
+        scrubber: Scrubber::with_secrets(vec![token.to_string()]),
+        clock: HostClock::Fixed(7),
+        log_sink: log_sink.clone(),
+        linear: Some(LinearCapability::with_default_allowlist(transport.clone())),
+        ..Default::default()
+    };
+
+    let out = run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        caps,
+        serde_json::json!({
+            "linear_operation": "Viewer",
+            "linear_query": "query Viewer { viewer { id } }",
+            "linear_variables": "{\"first\":1}",
+            "linear_mode": "read",
+        }),
+    )
+    .expect("guest run succeeds");
+
+    assert!(!out.is_error);
+    let summary: serde_json::Value = serde_json::from_str(&out.result_json).unwrap();
+    assert_eq!(summary["linear"]["status"], 200);
+    assert!(
+        summary["linear"]["body_json"]
+            .as_str()
+            .unwrap()
+            .contains("u_42"),
+        "guest should observe the GraphQL response body: {}",
+        out.result_json,
+    );
+
+    // The host transport saw the host-normalised call; the guest never
+    // supplied a header or endpoint.
+    let calls = transport.seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].operation_name.as_deref(), Some("Viewer"));
+    assert_eq!(calls[0].endpoint, LinearCapability::DEFAULT_ENDPOINT);
+
+    // The raw token must not appear in anything the guest can read or that is
+    // logged.
+    assert!(
+        !out.result_json.contains(token),
+        "token leaked into guest result: {}",
+        out.result_json,
+    );
+    let audit = log_sink
+        .records()
+        .into_iter()
+        .find(|r| r.op == "host-linear.linear-graphql")
+        .expect("a host-linear audit record");
+    let dump = format!("{audit:?}");
+    assert!(!dump.contains(token), "token leaked into audit log: {dump}");
+    // The audit fingerprints the query rather than logging it verbatim.
+    let fields = audit.fields_json.expect("audit carries fields");
+    assert!(fields.contains("query_fingerprint"), "fields: {fields}");
+    assert!(
+        !fields.contains("viewer { id }"),
+        "raw query text leaked into audit: {fields}",
+    );
+}
+
+#[test]
+fn example_plugin_passes_object_form_linear_variables() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let loaded = load(&rt);
+    let transport = MockLinearTransport::new("tok", r#"{"data":{}}"#);
+    let caps = HostCapabilities {
+        clock: HostClock::Fixed(1),
+        linear: Some(LinearCapability::with_default_allowlist(transport.clone())),
+        ..Default::default()
+    };
+
+    run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        caps,
+        // Object form, not a string — must reach the host as object JSON, not {}.
+        serde_json::json!({
+            "linear_query": "query Q($first:Int){ issues(first:$first){ nodes { id } } }",
+            "linear_variables": { "first": 1 },
+        }),
+    )
+    .expect("guest run succeeds");
+
+    let calls = transport.seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    let vars: serde_json::Value = serde_json::from_str(&calls[0].variables_json).unwrap();
+    assert_eq!(
+        vars["first"], 1,
+        "object variables were dropped: {:?}",
+        calls[0].variables_json
+    );
+}
+
+#[test]
+fn example_plugin_linear_denied_when_capability_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let loaded = load(&rt);
+
+    // No linear capability configured: the guest call must fail closed.
+    let result = run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        HostCapabilities {
+            clock: HostClock::Fixed(1),
+            ..Default::default()
+        },
+        serde_json::json!({
+            "linear_query": "query { viewer { id } }",
+        }),
+    );
+
+    assert!(
+        matches!(result, Err(HostError::Denied(_))),
+        "unconfigured linear capability should deny, got {result:?}",
     );
 }
 

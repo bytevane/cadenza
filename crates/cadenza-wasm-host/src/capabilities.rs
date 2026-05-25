@@ -1,11 +1,10 @@
 //! Host capability implementations for the `cadenza:runtime@0.2.0`
-//! `tool-runtime` world (issue #16).
+//! `tool-runtime` world (issues #16, #17).
 //!
-//! Only the four in-scope imports are implemented and linked:
-//! `host-log`, `host-time`, `host-workspace`, `host-secrets`. `host-http`,
-//! `host-linear`, and `host-tools` are deliberately *not* linked — the
-//! example guest does not import them, so instantiation succeeds without
-//! them, and they remain deferred to their own issues (see ADR 0005).
+//! Five host imports are implemented and linked: `host-log`, `host-time`,
+//! `host-workspace`, `host-secrets` (ADR 0005) and `host-linear` (ADR 0006).
+//! `host-http` and `host-tools` are deliberately *not* linked — they remain
+//! deferred to their own issues; a guest importing them would trap.
 //!
 //! Security posture:
 //! - `workspace-read` resolves the guest path through the `cadenza-workspace`
@@ -14,6 +13,11 @@
 //!   `host-error::outside-root`.
 //! - `secret-exists` answers from a presence-only name set; no value is ever
 //!   reachable through the WIT.
+//! - `linear-graphql` injects the operator's Linear credential behind a
+//!   host-side transport; the raw token never reaches guest memory, and
+//!   upstream error strings are scrubbed before they cross back as a
+//!   `host-error`. The WIT gives the guest no header channel, so a
+//!   plugin-supplied `Authorization` header is structurally impossible.
 //! - `log` redacts the message and fields with the shared `cadenza-obs`
 //!   `Scrubber` before anything is recorded.
 //! - Every host call records issue/plugin context via the captured log sink
@@ -26,7 +30,10 @@ use camino::Utf8Path;
 use wasmtime::Store;
 use wasmtime::component::{HasSelf, Linker};
 
-use crate::{ComponentRuntime, HostLogRecord, LoadedComponent, StoreState, WasmHostError};
+use crate::{
+    ComponentRuntime, HostLogRecord, LinearCall, LinearMode, LinearTransportError, LoadedComponent,
+    StoreState, WasmHostError,
+};
 
 wasmtime::component::bindgen!({
     path: "../../wit",
@@ -34,12 +41,13 @@ wasmtime::component::bindgen!({
 });
 
 pub use cadenza::runtime::types::{
-    HostError, LogLevel, ToolInput, ToolOutput, WorkspaceReadResult,
+    GraphqlMode, GraphqlResponse, HostError, LogLevel, ToolInput, ToolOutput, WorkspaceReadResult,
 };
 
-/// Wire the four in-scope host interfaces into `linker`. The guest's
-/// incidental WASI imports are stubbed as traps in
-/// [`ComponentRuntime::run_tool`] rather than granted.
+/// Wire the in-scope host interfaces into `linker` (`host-log`, `host-time`,
+/// `host-workspace`, `host-secrets`, `host-linear`). The guest's incidental
+/// WASI imports are stubbed as traps in [`ComponentRuntime::run_tool`] rather
+/// than granted.
 pub(crate) fn add_host_capabilities(linker: &mut Linker<StoreState>) -> Result<(), WasmHostError> {
     let link_err = |e: wasmtime::Error| WasmHostError::Link(e.to_string());
     cadenza::runtime::host_log::add_to_linker::<_, HasSelf<StoreState>>(linker, |s| s)
@@ -50,11 +58,13 @@ pub(crate) fn add_host_capabilities(linker: &mut Linker<StoreState>) -> Result<(
         .map_err(link_err)?;
     cadenza::runtime::host_secrets::add_to_linker::<_, HasSelf<StoreState>>(linker, |s| s)
         .map_err(link_err)?;
+    cadenza::runtime::host_linear::add_to_linker::<_, HasSelf<StoreState>>(linker, |s| s)
+        .map_err(link_err)?;
     Ok(())
 }
 
 impl ComponentRuntime {
-    /// Instantiate `loaded` against a fresh linker carrying the four host
+    /// Instantiate `loaded` against a fresh linker carrying the linked host
     /// capabilities, then call the guest's exported `tool.run`.
     ///
     /// The outer `Result` carries host/trap failures; the inner `Result` is
@@ -67,12 +77,12 @@ impl ComponentRuntime {
         input: ToolInput,
     ) -> Result<Result<ToolOutput, HostError>, WasmHostError> {
         let mut linker = Linker::<StoreState>::new(self.engine());
-        // Stub *every* import as a trap first, then shadow the four in-scope
-        // host interfaces with their real implementations. The guest's
-        // incidental WASI imports (from the Rust std runtime) therefore grant
-        // nothing — no preopens, env, clocks, random, sockets, or filesystem
-        // reach the guest; a guest that calls a WASI function traps (surfaced
-        // via `classify_trap`). The only live capabilities are the four host
+        // Stub *every* import as a trap first, then shadow the in-scope host
+        // interfaces with their real implementations. The guest's incidental
+        // WASI imports (from the Rust std runtime) therefore grant nothing —
+        // no preopens, env, clocks, random, sockets, or filesystem reach the
+        // guest; a guest that calls a WASI function traps (surfaced via
+        // `classify_trap`). The only live capabilities are the linked host
         // functions, satisfying the issue's "minimal capability" requirement.
         linker.allow_shadowing(true);
         linker
@@ -179,6 +189,267 @@ impl cadenza::runtime::host_secrets::Host for StoreState {
         // Presence only — the value is never stored or returned.
         Ok(self.caps.secret_names.contains(&name))
     }
+}
+
+impl cadenza::runtime::host_linear::Host for StoreState {
+    fn linear_graphql(
+        &mut self,
+        operation_name: Option<String>,
+        query: String,
+        variables_json: String,
+        mode: GraphqlMode,
+    ) -> Result<GraphqlResponse, HostError> {
+        let host_mode = match mode {
+            GraphqlMode::Read => LinearMode::Read,
+            GraphqlMode::Write => LinearMode::Write,
+        };
+        // Fingerprint up front so even a denied/errored call is audited
+        // without ever logging the raw query text.
+        let fingerprint = query_fingerprint(&query);
+        let started = std::time::Instant::now();
+        let outcome = self.dispatch_linear(
+            operation_name.as_deref(),
+            &query,
+            &variables_json,
+            host_mode,
+        );
+        let duration_ms = started.elapsed().as_millis() as u64;
+        // The guest receives only the typed variant + a generic message; the
+        // detailed (scrubbed, capped) failure text stays host-side in the audit.
+        let (guest_result, audit_error) = match outcome {
+            Ok(resp) => (Ok(resp), None),
+            Err(failure) => (Err(failure.guest), Some(failure.audit_detail)),
+        };
+        self.record_linear_audit(
+            operation_name.as_deref(),
+            &fingerprint,
+            duration_ms,
+            host_mode,
+            audit_error.as_deref(),
+        );
+        guest_result
+    }
+}
+
+/// Max bytes of failure detail retained in the audit log for a single
+/// `linear-graphql` call. The transport may include an arbitrarily large
+/// upstream body in its error string; capping before storage keeps a chatty
+/// failure from bloating the bounded log sink host-side.
+const MAX_AUDIT_ERROR_BYTES: usize = 512;
+
+/// A `linear-graphql` failure split into what the guest may see (`guest`: a
+/// typed variant with a *generic* message, never carrying upstream text or a
+/// token) and what is retained host-side for the audit (`audit_detail`:
+/// scrubbed + length-capped). Keeping these separate means the
+/// "token never reaches guest memory" guarantee does not depend on the caller
+/// having seeded the scrubber with the transport credential.
+struct LinearFailure {
+    guest: HostError,
+    audit_detail: String,
+}
+
+impl LinearFailure {
+    fn denied(message: &str) -> Self {
+        Self {
+            guest: HostError::Denied(message.to_string()),
+            audit_detail: format!("denied: {message}"),
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            audit_detail: format!("invalid-argument: {message}"),
+            guest: HostError::InvalidArgument(message),
+        }
+    }
+}
+
+impl StoreState {
+    /// Validate the call against host policy and hand it to the configured
+    /// transport. The error half is a [`LinearFailure`] so the caller can route
+    /// a generic message to the guest while auditing the detail host-side.
+    fn dispatch_linear(
+        &self,
+        operation_name: Option<&str>,
+        query: &str,
+        variables_json: &str,
+        mode: LinearMode,
+    ) -> Result<GraphqlResponse, LinearFailure> {
+        let cap = self
+            .caps
+            .linear
+            .as_ref()
+            .ok_or_else(|| LinearFailure::denied("linear capability not configured"))?;
+        // Endpoint allowlist: the endpoint is host-configured (the guest never
+        // supplies a URL); a misconfiguration fails closed.
+        if !cap.endpoint_allowed() {
+            return Err(LinearFailure::denied(
+                "linear endpoint is not on the allowlist",
+            ));
+        }
+        if query.trim().is_empty() {
+            return Err(LinearFailure::invalid("query must not be empty"));
+        }
+        // Normalise/validate variables: empty means `{}`; anything present
+        // must parse as a JSON *object* — GraphQL request variables are a
+        // name→value map, so a scalar/array is rejected before the request.
+        let trimmed = variables_json.trim();
+        let normalised_vars = if trimmed.is_empty() {
+            "{}".to_string()
+        } else {
+            let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                LinearFailure::invalid(format!("variables-json is not valid JSON: {e}"))
+            })?;
+            if !parsed.is_object() {
+                return Err(LinearFailure::invalid(
+                    "variables-json must be a JSON object",
+                ));
+            }
+            trimmed.to_string()
+        };
+
+        let call = LinearCall {
+            operation_name: operation_name.map(str::to_string),
+            query: query.to_string(),
+            variables_json: normalised_vars,
+            mode,
+            endpoint: cap.endpoint().to_string(),
+            // Hand the limit to the transport so it can bound its own read and
+            // never materialise an oversized body host-side.
+            max_response_bytes: self.http_body_limit,
+        };
+        match cap.transport().execute(call) {
+            Ok(res) => {
+                // Backstop: even if the transport over-read, refuse to hand a
+                // body larger than `max_http_body_bytes` across to guest
+                // memory. Bounding the host-side allocation itself is the
+                // transport's responsibility (see `LinearCall::max_response_bytes`).
+                if res.body_json.len() > self.http_body_limit {
+                    return Err(LinearFailure {
+                        guest: HostError::Upstream("linear response body too large".to_string()),
+                        audit_detail: format!(
+                            "response body exceeds limit of {} bytes",
+                            self.http_body_limit
+                        ),
+                    });
+                }
+                Ok(GraphqlResponse {
+                    status: res.status,
+                    body_json: res.body_json,
+                })
+            }
+            Err(err) => Err(self.map_transport_failure(err)),
+        }
+    }
+
+    /// Map a transport failure into a [`LinearFailure`]. The guest-facing error
+    /// carries a fixed, generic message — the upstream/IO text is **never**
+    /// forwarded to the guest, so an upstream that echoes the Authorization
+    /// token cannot leak it regardless of whether the scrubber was seeded. The
+    /// detail (scrubbed + capped) is kept only for the host-side audit.
+    fn map_transport_failure(&self, err: LinearTransportError) -> LinearFailure {
+        let detail = |kind: &str, msg: String| {
+            let scrubbed = self.caps.scrubber.scrub_text(&msg);
+            format!("{kind}: {}", truncate_for_audit(&scrubbed))
+        };
+        match err {
+            LinearTransportError::RateLimited(hint) => LinearFailure {
+                guest: HostError::RateLimited(hint),
+                audit_detail: match hint {
+                    Some(secs) => format!("rate-limited: retry after {secs}s"),
+                    None => "rate-limited".to_string(),
+                },
+            },
+            LinearTransportError::Upstream(msg) => LinearFailure {
+                guest: HostError::Upstream("linear upstream error".to_string()),
+                audit_detail: detail("upstream", msg),
+            },
+            LinearTransportError::Io(msg) => LinearFailure {
+                guest: HostError::Io("linear transport io error".to_string()),
+                audit_detail: detail("io", msg),
+            },
+        }
+    }
+
+    /// Record one audit entry for a `linear-graphql` call. The raw query is
+    /// never logged — only the fingerprint, operation name (scrubbed),
+    /// duration, mode, and (on failure) the scrubbed + capped failure detail.
+    fn record_linear_audit(
+        &self,
+        operation_name: Option<&str>,
+        fingerprint: &str,
+        duration_ms: u64,
+        mode: LinearMode,
+        error_detail: Option<&str>,
+    ) {
+        use cadenza_obs::fields;
+        let scrub = |s: &str| self.caps.scrubber.scrub_text(s);
+        let mut map = serde_json::Map::new();
+        map.insert(
+            fields::FIELD_OPERATION_NAME.to_string(),
+            match operation_name {
+                Some(name) => serde_json::Value::String(scrub(name)),
+                None => serde_json::Value::Null,
+            },
+        );
+        map.insert(
+            fields::FIELD_QUERY_FINGERPRINT.to_string(),
+            serde_json::Value::String(fingerprint.to_string()),
+        );
+        map.insert(
+            fields::FIELD_DURATION_MS.to_string(),
+            serde_json::Value::Number(duration_ms.into()),
+        );
+        map.insert(
+            fields::FIELD_GRAPHQL_MODE.to_string(),
+            serde_json::Value::String(mode.label().to_string()),
+        );
+        if let Some(detail) = error_detail {
+            // Defensive re-scrub: transport detail is already scrubbed, but
+            // locally-built denial/invalid messages pass through here too.
+            map.insert(
+                fields::FIELD_ERROR.to_string(),
+                serde_json::Value::String(scrub(detail)),
+            );
+        }
+        let fields_json = serde_json::Value::Object(map).to_string();
+        self.record_call(
+            "host-linear.linear-graphql",
+            None,
+            None,
+            Some("linear graphql operation".to_string()),
+            Some(fields_json),
+        );
+    }
+}
+
+/// Truncate failure detail to [`MAX_AUDIT_ERROR_BYTES`] on a UTF-8 char
+/// boundary, appending an ellipsis marker when clipped, so a transport that
+/// stuffs a large upstream body into its error string cannot bloat the audit.
+fn truncate_for_audit(text: &str) -> String {
+    if text.len() <= MAX_AUDIT_ERROR_BYTES {
+        return text.to_string();
+    }
+    let mut end = MAX_AUDIT_ERROR_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &text[..end])
+}
+
+/// Non-cryptographic FNV-1a-64 fingerprint of a GraphQL query, hex-encoded.
+/// Used so the audit log can correlate identical operations without recording
+/// the raw query text. Not a security primitive.
+fn query_fingerprint(query: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in query.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("fnv1a64:{hash:016x}")
 }
 
 fn level_label(level: LogLevel) -> &'static str {
@@ -575,5 +846,423 @@ mod tests {
             matches!(err, HostError::OutsideRoot),
             "symlink escape must map to outside-root, got {err:?}",
         );
+    }
+
+    // --- host-linear (#17) ---
+
+    use super::cadenza::runtime::host_linear::Host as _;
+    use crate::{
+        ComponentRuntime, HostCapabilities, HostClock, LinearCall, LinearCapability,
+        LinearHttpResult, LinearTransport, LinearTransportError, LogSink, RequestContext,
+        WasmRuntimeLimits,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// Mock transport that is the *host-side* injector of auth. It records the
+    /// calls it received (so a test can assert the guest never influenced
+    /// headers) and returns a canned result/error. The `injected_token` models
+    /// the credential that lives host-side and must never reach the guest.
+    #[derive(Debug)]
+    struct MockTransport {
+        injected_token: String,
+        result: Mutex<Option<Result<LinearHttpResult, LinearTransportError>>>,
+        seen: Mutex<Vec<LinearCall>>,
+    }
+
+    impl MockTransport {
+        fn ok(body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                injected_token: "lr_live_HOSTONLY".to_string(),
+                result: Mutex::new(Some(Ok(LinearHttpResult {
+                    status: 200,
+                    body_json: body.to_string(),
+                }))),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn erroring(err: LinearTransportError) -> Arc<Self> {
+            Arc::new(Self {
+                injected_token: "lr_live_HOSTONLY".to_string(),
+                result: Mutex::new(Some(Err(err))),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<LinearCall> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl LinearTransport for MockTransport {
+        fn execute(&self, call: LinearCall) -> Result<LinearHttpResult, LinearTransportError> {
+            // The transport — not the guest — is where auth is injected.
+            let _auth_header = format!("Authorization: Bearer {}", self.injected_token);
+            self.seen.lock().unwrap().push(call);
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(LinearTransportError::Io("mock exhausted".to_string())))
+        }
+    }
+
+    fn linear_store(
+        cap: Option<LinearCapability>,
+        scrubber: Scrubber,
+    ) -> wasmtime::Store<StoreState> {
+        linear_store_with(WasmRuntimeLimits::default(), cap, scrubber)
+    }
+
+    fn linear_store_with(
+        limits: WasmRuntimeLimits,
+        cap: Option<LinearCapability>,
+        scrubber: Scrubber,
+    ) -> wasmtime::Store<StoreState> {
+        let rt = ComponentRuntime::new(limits).unwrap();
+        let log_sink = LogSink::new();
+        rt.new_store_with(
+            RequestContext {
+                issue_id: Some("CAD-17".to_string()),
+                plugin_name: Some("linear-example".to_string()),
+                ..Default::default()
+            },
+            HostCapabilities {
+                scrubber,
+                clock: HostClock::Fixed(1),
+                log_sink,
+                linear: cap,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn last_audit(store: &wasmtime::Store<StoreState>) -> HostLogRecord {
+        store
+            .data()
+            .log_sink()
+            .records()
+            .into_iter()
+            .find(|r| r.op == "host-linear.linear-graphql")
+            .expect("a host-linear audit record")
+    }
+
+    #[test]
+    fn linear_unconfigured_capability_is_denied() {
+        let mut store = linear_store(None, Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                Some("Q".to_string()),
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("missing capability must deny");
+        assert!(matches!(err, HostError::Denied(_)), "got {err:?}");
+        // Even a denied call is audited.
+        let audit = last_audit(&store);
+        let fields: serde_json::Value =
+            serde_json::from_str(audit.fields_json.as_deref().unwrap()).unwrap();
+        assert!(fields[cadenza_obs::fields::FIELD_QUERY_FINGERPRINT].is_string());
+    }
+
+    #[test]
+    fn linear_endpoint_off_allowlist_is_denied() {
+        let transport = MockTransport::ok("{}");
+        // Endpoint not present in the allowlist set.
+        let cap = LinearCapability::new(
+            "https://evil.example/graphql",
+            ["https://api.linear.app/graphql".to_string()],
+            transport.clone(),
+        );
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("off-allowlist endpoint must deny");
+        assert!(matches!(err, HostError::Denied(_)), "got {err:?}");
+        // The transport must never have been reached.
+        assert!(
+            transport.calls().is_empty(),
+            "denied call hit the transport"
+        );
+    }
+
+    #[test]
+    fn linear_empty_query_is_invalid_argument() {
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(None, "   ".to_string(), String::new(), GraphqlMode::Read)
+            .expect_err("empty query must be rejected");
+        assert!(matches!(err, HostError::InvalidArgument(_)), "got {err:?}");
+        // Validation happens before any request — a malformed call must never
+        // reach the upstream.
+        assert!(
+            transport.calls().is_empty(),
+            "rejected call hit the transport"
+        );
+    }
+
+    #[test]
+    fn linear_invalid_variables_json_is_invalid_argument() {
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                "{not json".to_string(),
+                GraphqlMode::Read,
+            )
+            .expect_err("malformed variables must be rejected");
+        assert!(matches!(err, HostError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            transport.calls().is_empty(),
+            "rejected call hit the transport"
+        );
+    }
+
+    #[test]
+    fn linear_non_object_variables_are_rejected() {
+        // Valid JSON but not an object — GraphQL variables must be a map.
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                "[1,2,3]".to_string(),
+                GraphqlMode::Read,
+            )
+            .expect_err("array variables must be rejected");
+        assert!(matches!(err, HostError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            transport.calls().is_empty(),
+            "rejected call hit the transport"
+        );
+    }
+
+    #[test]
+    fn linear_oversized_response_body_is_rejected() {
+        // A response body larger than the runtime's max_http_body_bytes must
+        // not cross into guest memory; it fails with a typed error instead.
+        let limits = WasmRuntimeLimits {
+            max_http_body_bytes: 16,
+            ..Default::default()
+        };
+        let big = "x".repeat(64);
+        let transport = MockTransport::ok(&big);
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let mut store = linear_store_with(limits, Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("oversized body must be rejected");
+        assert!(
+            matches!(err, HostError::Upstream(ref m) if m.contains("too large")),
+            "got {err:?}",
+        );
+    }
+
+    #[test]
+    fn linear_allowed_operation_returns_transport_body_and_audits() {
+        let transport = MockTransport::ok(r#"{"data":{"viewer":{"id":"u_1"}}}"#);
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+
+        let resp = store
+            .data_mut()
+            .linear_graphql(
+                Some("Viewer".to_string()),
+                "query Viewer { viewer { id } }".to_string(),
+                r#"{"first":1}"#.to_string(),
+                GraphqlMode::Read,
+            )
+            .expect("allowed operation succeeds");
+        assert_eq!(resp.status, 200);
+        assert!(resp.body_json.contains("u_1"));
+
+        // The transport saw exactly the host-normalised call; the guest never
+        // supplied a header (the WIT has no header channel).
+        let calls = transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].operation_name.as_deref(), Some("Viewer"));
+        assert_eq!(calls[0].endpoint, LinearCapability::DEFAULT_ENDPOINT);
+        assert_eq!(calls[0].variables_json, r#"{"first":1}"#);
+        // The runtime's response-size limit is handed to the transport so it
+        // can bound its own read.
+        assert_eq!(
+            calls[0].max_response_bytes,
+            WasmRuntimeLimits::default().max_http_body_bytes
+        );
+
+        // Audit carries operation name, fingerprint, duration, and mode; no
+        // error on the success path.
+        let audit = last_audit(&store);
+        let fields: serde_json::Value =
+            serde_json::from_str(audit.fields_json.as_deref().unwrap()).unwrap();
+        assert_eq!(fields[cadenza_obs::fields::FIELD_OPERATION_NAME], "Viewer");
+        assert!(
+            fields[cadenza_obs::fields::FIELD_QUERY_FINGERPRINT]
+                .as_str()
+                .unwrap()
+                .starts_with("fnv1a64:")
+        );
+        assert!(fields[cadenza_obs::fields::FIELD_DURATION_MS].is_number());
+        assert_eq!(fields[cadenza_obs::fields::FIELD_GRAPHQL_MODE], "read");
+        assert!(fields.get(cadenza_obs::fields::FIELD_ERROR).is_none());
+    }
+
+    #[test]
+    fn linear_empty_variables_normalise_to_empty_object() {
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Write,
+            )
+            .expect("succeeds");
+        assert_eq!(transport.calls()[0].variables_json, "{}");
+        // Write mode is logged distinctly from read.
+        let audit = last_audit(&store);
+        let fields: serde_json::Value =
+            serde_json::from_str(audit.fields_json.as_deref().unwrap()).unwrap();
+        assert_eq!(fields[cadenza_obs::fields::FIELD_GRAPHQL_MODE], "write");
+    }
+
+    #[test]
+    fn linear_upstream_error_never_forwards_text_to_guest() {
+        // The upstream echoes the host-only token in its error body AND the
+        // scrubber is EMPTY (caller forgot to seed it). The guest must still
+        // never see the token: the guest-facing error is a generic typed
+        // variant, so safety does not depend on scrubber seeding.
+        let token = "lr_live_HOSTONLY";
+        let transport = MockTransport::erroring(LinearTransportError::Upstream(format!(
+            "unauthorized: token {token} rejected"
+        )));
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("upstream failure must surface as host-error");
+        let HostError::Upstream(msg) = &err else {
+            panic!("expected upstream, got {err:?}");
+        };
+        assert!(!msg.contains(token), "token leaked to guest: {msg}");
+        // The guest message is generic — it carries no upstream text at all.
+        assert!(
+            !msg.contains("unauthorized"),
+            "upstream text leaked to guest: {msg}",
+        );
+    }
+
+    #[test]
+    fn linear_upstream_error_detail_is_scrubbed_and_capped_in_audit() {
+        // A seeded scrubber redacts the token from the host-side audit detail,
+        // and an oversized upstream error string is capped so it cannot bloat
+        // the bounded log sink.
+        let token = "lr_live_HOSTONLY";
+        let big = format!("{token} {}", "A".repeat(4096));
+        let transport = MockTransport::erroring(LinearTransportError::Upstream(big));
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let scrubber = Scrubber::with_secrets(vec![token.to_string()]);
+        let mut store = linear_store(Some(cap), scrubber);
+
+        store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("upstream failure must surface");
+
+        let audit = last_audit(&store);
+        let fields = audit.fields_json.expect("audit fields");
+        assert!(!fields.contains(token), "token leaked into audit: {fields}");
+        // The detail is capped well below the 4 KiB upstream string.
+        let parsed: serde_json::Value = serde_json::from_str(&fields).unwrap();
+        let detail = parsed[cadenza_obs::fields::FIELD_ERROR].as_str().unwrap();
+        assert!(
+            detail.len() < 700,
+            "audit error detail not capped ({} bytes): {detail}",
+            detail.len(),
+        );
+        assert!(detail.contains("truncated"), "expected truncation marker");
+    }
+
+    #[test]
+    fn linear_rate_limit_carries_retry_hint() {
+        let transport = MockTransport::erroring(LinearTransportError::RateLimited(Some(30)));
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("rate limit must surface");
+        assert!(
+            matches!(err, HostError::RateLimited(Some(30))),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn query_fingerprint_is_deterministic_and_distinguishes_queries() {
+        let a = query_fingerprint("query { viewer { id } }");
+        let b = query_fingerprint("query { viewer { id } }");
+        let c = query_fingerprint("mutation { x }");
+        assert_eq!(a, b, "fingerprint must be deterministic");
+        assert_ne!(a, c, "different queries must differ");
+        assert!(a.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn linear_audit_field_constants_match() {
+        // Pin the audit field names so a rename of the cadenza-obs contract is
+        // caught here rather than silently drifting.
+        assert_eq!(cadenza_obs::fields::FIELD_OPERATION_NAME, "operation_name");
+        assert_eq!(
+            cadenza_obs::fields::FIELD_QUERY_FINGERPRINT,
+            "query_fingerprint"
+        );
+        assert_eq!(cadenza_obs::fields::FIELD_DURATION_MS, "duration_ms");
+        assert_eq!(cadenza_obs::fields::FIELD_GRAPHQL_MODE, "graphql_mode");
+        assert_eq!(cadenza_obs::fields::FIELD_ERROR, "error");
     }
 }
