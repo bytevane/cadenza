@@ -413,10 +413,12 @@ impl LogSink {
 ///
 /// **Explicitly out of scope: instance/table *count*-cap denials.**
 /// `instances()` / `tables()` report the count caps, but Wasmtime enforces
-/// those at allocation time and does *not* call back into the limiter when
-/// a cap is hit — the limiter cannot observe a count-cap denial, so neither
-/// counter moves for it. Such denials instead surface to the caller as
-/// instantiation errors classified by [`classify_trap`] into
+/// those during instantiation (`bump_resource_counts`) and does *not* call
+/// back into the limiter when a cap is hit — the limiter cannot observe a
+/// count-cap denial, so neither counter moves for it. Such a denial is a
+/// plain `"resource limit exceeded"` error, *not* a `wasmtime::Trap`, so it
+/// surfaces to the caller as an instantiation failure mapped to
+/// [`WasmHostError::Link`] (see `classify_instantiate`), not as a trap-derived
 /// [`WasmHostError::LimitBreached`].
 #[derive(Debug, Clone)]
 pub struct RuntimeLimiter {
@@ -966,27 +968,14 @@ mod tests {
         assert_eq!(limiter.denied_growth(), 0);
     }
 
-    #[test]
-    fn count_cap_reporting_does_not_touch_denial_counters() {
-        // Path 3 of issue #63 is EXPLICITLY EXCLUDED from the limiter's
-        // denial telemetry: wasmtime enforces the instance/table COUNT caps
-        // at allocation time and never calls back into the limiter, so the
-        // limiter cannot observe a count-cap denial. Reading the caps
-        // (`instances()` / `tables()`) must therefore be side-effect free and
-        // leave both denial counters at zero. Count-cap denials surface to
-        // the caller as instantiation errors classified by `classify_trap`,
-        // not through these counters.
-        let limits = WasmRuntimeLimits {
-            max_instances: 2,
-            max_tables: 3,
-            ..Default::default()
-        };
-        let limiter = RuntimeLimiter::new(&limits);
-        let _ = ResourceLimiter::instances(&limiter);
-        let _ = ResourceLimiter::tables(&limiter);
-        assert_eq!(limiter.denied_growth(), 0);
-        assert_eq!(limiter.grow_failed_after_allow(), 0);
-    }
+    // Path 3 of issue #63 (instance/table COUNT-cap denials are out of scope
+    // for the limiter's counters) is covered end-to-end by
+    // `count_cap_denial_surfaces_as_link_and_leaves_counters_untouched` in
+    // tests/host_capabilities.rs, which trips the real instance-count cap and
+    // asserts both the surfaced error variant and that neither counter moved.
+    // It cannot be a unit test here: the limiter is never called back for a
+    // count-cap denial, so the path only exists when a real component is
+    // instantiated.
 
     #[test]
     fn request_context_has_no_raw_secret_field() {
