@@ -513,15 +513,20 @@ impl LogSink {
 ///   callbacks, never via the limiter-denial path, so they are tracked apart
 ///   from limiter decisions.
 ///
-/// **Explicitly out of scope: instance/table *count*-cap denials.**
-/// `instances()` / `tables()` report the count caps, but Wasmtime enforces
-/// those during instantiation (`bump_resource_counts`) and does *not* call
-/// back into the limiter when a cap is hit — the limiter cannot observe a
-/// count-cap denial, so neither counter moves for it. Such a denial is a
-/// plain `"resource limit exceeded"` error, *not* a `wasmtime::Trap`, so it
-/// surfaces to the caller as an instantiation failure mapped to
-/// [`WasmHostError::Link`] (see `classify_instantiate`), not as a trap-derived
-/// [`WasmHostError::LimitBreached`].
+/// **Explicitly out of scope: instance/table/memory *count*-cap denials never
+/// move these counters.** `instances()` / `tables()` / `memories()` report the
+/// count caps, but Wasmtime enforces those during instantiation
+/// (`bump_resource_counts`) and does *not* call back into the limiter when a cap
+/// is hit — the limiter cannot observe a count-cap denial, so neither counter
+/// moves for it. Classifying such a denial is handled outside this limiter: the
+/// host pre-checks the typed `Component::resources_required` table/memory counts
+/// before instantiation and surfaces an over-cap as
+/// [`WasmHostError::LimitBreached`] (issue #82; see
+/// `capabilities::check_declared_resource_counts`). The *instance* count-cap
+/// breach — which wasmtime 45 exposes no public count to pre-check — still bails
+/// with a plain `"resource limit exceeded"` string (not a `wasmtime::Trap`) and
+/// surfaces as [`WasmHostError::Link`] (see `classify_instantiate`; tracked in
+/// #86).
 #[derive(Debug, Clone)]
 pub struct RuntimeLimiter {
     max_memory_bytes: usize,

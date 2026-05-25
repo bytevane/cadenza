@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use camino::Utf8Path;
-use wasmtime::Store;
 use wasmtime::component::{HasSelf, Linker, types::ComponentItem};
+use wasmtime::{ResourceLimiter, Store};
 
 use crate::{
     ComponentRuntime, DeferredCapability, HostLogRecord, LinearCall, LinearHttpResult, LinearMode,
@@ -193,6 +193,21 @@ impl ComponentRuntime {
         // here makes the budget measure this invocation's execution, not the
         // store's age (issue #62 review follow-up).
         store.set_epoch_deadline(self.epoch_budget_ticks());
+        // Reject — before instantiation — a component whose statically-declared
+        // table/memory counts exceed the host caps, so a count-cap breach
+        // surfaces as the precise `LimitBreached` rather than the stringly-typed
+        // wasmtime count error that `classify_instantiate` could only label
+        // `Link` (issue #82). The caps are read from the very `RuntimeLimiter`
+        // wasmtime enforces against, so this never diverges from wasmtime's own
+        // check — it just runs first with a typed cause.
+        let (table_cap, memory_cap) = {
+            let limiter = &store.data().limiter;
+            (
+                ResourceLimiter::tables(limiter),
+                ResourceLimiter::memories(limiter),
+            )
+        };
+        check_declared_resource_counts(&loaded.component, table_cap, memory_cap)?;
         let mut linker = Linker::<StoreState>::new(self.engine());
         // Stub *every* import first, then shadow the in-scope host interfaces
         // with their real implementations. The guest's incidental WASI
@@ -803,12 +818,15 @@ fn read_window<R: Read + Seek>(
 /// declared memory/table no longer mislabels as `Link`, and a deferred host
 /// import called during init no longer mislabels as `LimitBreached`.
 ///
-/// One resource-limit sub-case is deliberately left as `Link`: a *count*-cap
-/// breach (too many instances/tables/memories, enforced by wasmtime via
-/// `Store::bump_resource_counts`) bails with a plain string and carries no
-/// typed payload or `Trap` in wasmtime 45, so there is no non-fragile signal
-/// to downcast. Fixing that precisely needs upstream support and is out of
-/// scope for #75 (whose example is the size-growth path handled above).
+/// Table/memory *count*-cap breaches never reach this function: they are
+/// caught before instantiation by [`check_declared_resource_counts`], which
+/// reads the typed [`wasmtime::component::Component::resources_required`] counts
+/// and surfaces an over-cap as `LimitBreached` directly (issue #82). The
+/// remaining sub-case — an *instance* count-cap breach — is still left as
+/// `Link`: wasmtime 45 exposes no public component instance count to pre-check,
+/// and its `Store::bump_resource_counts` bails with a plain string carrying no
+/// typed payload or `Trap` to downcast. Fixing that precisely needs upstream
+/// support and is tracked in #86.
 pub(crate) fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
     if let Some(breach) = err.downcast_ref::<crate::ResourceLimitBreached>() {
         return WasmHostError::LimitBreached(breach.to_string());
@@ -821,6 +839,54 @@ pub(crate) fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
     } else {
         WasmHostError::Link(format!("instantiate: {err}"))
     }
+}
+
+/// Reject — *before* instantiation — a component whose statically-declared
+/// table or memory count exceeds the host cap, so a count-cap breach surfaces
+/// as the precise [`WasmHostError::LimitBreached`] instead of the stringly-typed
+/// wasmtime count error (`"resource limit exceeded: {desc} count too high"`,
+/// emitted by `Store::bump_resource_counts`) that [`classify_instantiate`] could
+/// only map to `Link` (issue #82).
+///
+/// The counts come from the typed
+/// [`wasmtime::component::Component::resources_required`] summary — *not* an
+/// error-message substring (issue #82 AC2). `table_cap` / `memory_cap` are the
+/// same values wasmtime reads from the store's `RuntimeLimiter`
+/// (`ResourceLimiter::tables` / `memories`), so this check can never diverge
+/// from wasmtime's own enforcement: it runs first only to attach a typed cause,
+/// and wasmtime keeps enforcing the identical caps as a fail-closed backstop.
+///
+/// `resources_required` returns `None` when the component imports core modules
+/// or instances (its resource needs are then not statically knowable); cadenza's
+/// own plugins define all core modules statically, so this returns `Some`. On
+/// `None` the check is a no-op and wasmtime stays the sole authority — an
+/// over-cap then still surfaces as `Link`, exactly as before #82.
+///
+/// The **instance** count cap is deliberately not checked here: wasmtime 45's
+/// `ResourcesRequired` carries table/memory counts only, with no public
+/// component instance count, so an instance-count breach still classifies as
+/// `Link` (tracked in #86).
+fn check_declared_resource_counts(
+    component: &wasmtime::component::Component,
+    table_cap: usize,
+    memory_cap: usize,
+) -> Result<(), WasmHostError> {
+    let Some(required) = component.resources_required() else {
+        return Ok(());
+    };
+    if required.num_tables as usize > table_cap {
+        return Err(WasmHostError::LimitBreached(format!(
+            "component declares {} tables, exceeding the host cap of {table_cap}",
+            required.num_tables,
+        )));
+    }
+    if required.num_memories as usize > memory_cap {
+        return Err(WasmHostError::LimitBreached(format!(
+            "component declares {} memories, exceeding the host cap of {memory_cap}",
+            required.num_memories,
+        )));
+    }
+    Ok(())
 }
 
 /// Map a `cadenza-workspace` error onto the shared WIT `host-error`. Escapes
@@ -1078,6 +1144,75 @@ mod tests {
             classify_instantiate(err),
             WasmHostError::LimitBreached(_)
         ));
+    }
+
+    /// Compile a component from WAT against a component-model engine.
+    fn wat_component(wat: &str) -> wasmtime::component::Component {
+        let runtime = crate::ComponentRuntime::new(crate::WasmRuntimeLimits::default()).unwrap();
+        wasmtime::component::Component::new(runtime.engine(), wat).expect("compile wat component")
+    }
+
+    // Issue #82: a component declaring more *tables* than the host count cap
+    // must be rejected before instantiation with the precise `LimitBreached`,
+    // derived from the typed `resources_required()` count — not from a wasmtime
+    // error-message substring. The core module declares two tables, so
+    // `num_tables == 2`; a cap of 1 must trip. (Memory cap is left roomy so the
+    // table branch is what fires.)
+    #[test]
+    fn declared_table_count_over_cap_surfaces_as_limit_breached() {
+        let component = wat_component(
+            r#"
+            (component
+              (core module $m
+                (table 1 funcref)
+                (table 1 funcref))
+              (core instance (instantiate $m)))
+        "#,
+        );
+        let err = check_declared_resource_counts(&component, 1, usize::MAX)
+            .expect_err("two tables under a cap of one must be rejected");
+        assert!(
+            matches!(err, WasmHostError::LimitBreached(ref m) if m.contains("tables")),
+            "table count-cap breach must be LimitBreached, got {err:?}",
+        );
+    }
+
+    // Issue #82, memory counterpart: a component declaring more *memories* than
+    // the host count cap is rejected before instantiation as `LimitBreached`.
+    // The table cap is left roomy so only the memory branch can fire.
+    #[test]
+    fn declared_memory_count_over_cap_surfaces_as_limit_breached() {
+        let component = wat_component(
+            r#"
+            (component
+              (core module $m
+                (memory 1)
+                (memory 1))
+              (core instance (instantiate $m)))
+        "#,
+        );
+        let err = check_declared_resource_counts(&component, usize::MAX, 1)
+            .expect_err("two memories under a cap of one must be rejected");
+        assert!(
+            matches!(err, WasmHostError::LimitBreached(ref m) if m.contains("memories")),
+            "memory count-cap breach must be LimitBreached, got {err:?}",
+        );
+    }
+
+    // A component within both caps must pass the pre-check untouched, so the
+    // guard cannot false-positive a legitimately-sized component into a denial.
+    #[test]
+    fn declared_resource_counts_within_caps_pass() {
+        let component = wat_component(
+            r#"
+            (component
+              (core module $m
+                (table 1 funcref)
+                (memory 1))
+              (core instance (instantiate $m)))
+        "#,
+        );
+        assert!(check_declared_resource_counts(&component, 64, 64).is_ok());
     }
 
     // End-to-end proof for issue #75 case 2: a guest that calls an import the
