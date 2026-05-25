@@ -44,7 +44,17 @@ pub const WIT_WORLD: &str = "tool-runtime";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WasmRuntimeLimits {
     pub max_memory_bytes: usize,
+    /// Cap on the **count** of tables a component may allocate. Wasmtime's
+    /// default is 10_000; consulted by [`ResourceLimiter::tables`] at
+    /// allocation time. Distinct from [`Self::max_table_elements`], which
+    /// caps the per-table element count consulted at growth time.
     pub max_tables: usize,
+    /// Cap on the **element count** of any single table consulted by
+    /// [`ResourceLimiter::table_growing`]. A real `wasm32-wasip2` component's
+    /// function table can carry hundreds of entries, so this default must be
+    /// roomier than [`Self::max_tables`] for a genuine component to
+    /// instantiate (issue #74).
+    pub max_table_elements: usize,
     pub max_instances: usize,
     pub epoch_timeout_ms: u64,
     pub max_http_body_bytes: usize,
@@ -55,6 +65,11 @@ impl Default for WasmRuntimeLimits {
         Self {
             max_memory_bytes: 64 * 1024 * 1024,
             max_tables: 64,
+            // Generous enough that a real `wasm32-wasip2` component
+            // instantiates under the default — its function table can carry
+            // ~hundreds of entries, and the previous conflation with
+            // `max_tables = 64` denied instantiation outright (issue #74).
+            max_table_elements: 10_000,
             max_instances: 16,
             epoch_timeout_ms: 5_000,
             max_http_body_bytes: 2 * 1024 * 1024,
@@ -392,10 +407,19 @@ impl LogSink {
 /// at instance/memory/table allocation time. Tracks configured caps
 /// plus a counter of denied growth attempts so tests can assert
 /// breach behaviour.
+///
+/// `max_tables` and `max_table_elements` are deliberately distinct: the
+/// former bounds the *count* of tables a component may allocate (consulted
+/// by [`ResourceLimiter::tables`] at allocation time), the latter bounds the
+/// *element count* of any single table (consulted by
+/// [`ResourceLimiter::table_growing`] at growth time). They were previously
+/// conflated, which denied a real `wasm32-wasip2` component instantiation
+/// under the production default (issue #74).
 #[derive(Debug, Clone)]
 pub struct RuntimeLimiter {
     max_memory_bytes: usize,
     max_tables: usize,
+    max_table_elements: usize,
     max_instances: usize,
     denied_growth: usize,
 }
@@ -405,6 +429,7 @@ impl RuntimeLimiter {
         Self {
             max_memory_bytes: limits.max_memory_bytes,
             max_tables: limits.max_tables,
+            max_table_elements: limits.max_table_elements,
             max_instances: limits.max_instances,
             denied_growth: 0,
         }
@@ -420,6 +445,10 @@ impl RuntimeLimiter {
 
     pub fn max_tables(&self) -> usize {
         self.max_tables
+    }
+
+    pub fn max_table_elements(&self) -> usize {
+        self.max_table_elements
     }
 
     pub fn max_instances(&self) -> usize {
@@ -447,7 +476,10 @@ impl ResourceLimiter for RuntimeLimiter {
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        if desired > self.max_tables {
+        // Per-table element cap. Distinct from the table *count* cap returned
+        // by `tables()` — previously these were conflated, which denied a
+        // real component's function table at instantiation (issue #74).
+        if desired > self.max_table_elements {
             self.denied_growth = self.denied_growth.saturating_add(1);
             return Ok(false);
         }
@@ -464,8 +496,9 @@ impl ResourceLimiter for RuntimeLimiter {
 
     /// Cap on the number of tables a component can allocate. Same story
     /// as `instances()` — wasmtime defaults to 10_000 here too, so
-    /// without this override `max_tables` only constrains the growth of
-    /// each individual table, not how many tables exist (PR #52 codex P2).
+    /// without this override `max_tables` would be unenforced at allocation
+    /// time (PR #52 codex P2). The per-table element cap is independent and
+    /// consulted by `table_growing` via `max_table_elements` (issue #74).
     fn tables(&self) -> usize {
         self.max_tables
     }
@@ -792,6 +825,12 @@ mod tests {
             runtime.limits().max_memory_bytes
         );
         assert_eq!(data.limiter.max_tables(), runtime.limits().max_tables);
+        // Issue #74: per-table element cap must flow through the limiter
+        // independently of the table-count cap.
+        assert_eq!(
+            data.limiter.max_table_elements(),
+            runtime.limits().max_table_elements
+        );
         // PR #52 codex P1: max_instances must flow through the limiter
         // since StoreLimits is gone.
         assert_eq!(data.limiter.max_instances(), runtime.limits().max_instances);
@@ -812,10 +851,8 @@ mod tests {
 
     #[test]
     fn limiter_reports_tables_cap_to_wasmtime() {
-        // PR #52 codex P2: `table_growing` only constrains individual
-        // table growth, not the *count* of tables a component can
-        // allocate. The trait's `tables()` method must return the
-        // configured cap so wasmtime enforces it at allocation time.
+        // PR #52 codex P2: the trait's `tables()` method must return the
+        // configured *count* cap so wasmtime enforces it at allocation time.
         // Default trait impl returns 10_000.
         let limits = WasmRuntimeLimits {
             max_tables: 5,
@@ -823,6 +860,27 @@ mod tests {
         };
         let limiter = RuntimeLimiter::new(&limits);
         assert_eq!(ResourceLimiter::tables(&limiter), 5);
+    }
+
+    #[test]
+    fn limiter_table_count_and_element_caps_are_independent() {
+        // Issue #74 regression: the table *count* cap (`tables()`) and the
+        // per-table *element* cap (`table_growing`) must be configurable
+        // independently. A snug count cap of 1 must not prevent a single
+        // real table from growing past it, and vice versa: a snug element
+        // cap of 16 must not affect `tables()`.
+        let limits = WasmRuntimeLimits {
+            max_tables: 1,
+            max_table_elements: 16,
+            ..Default::default()
+        };
+        let mut limiter = RuntimeLimiter::new(&limits);
+        assert_eq!(ResourceLimiter::tables(&limiter), 1);
+        // Element cap, NOT count cap, governs growth: 64 > 16 must deny.
+        assert!(!limiter.table_growing(0, 64, None).unwrap());
+        // And 8 ≤ 16 must allow even though 8 ≥ max_tables.
+        assert!(limiter.table_growing(0, 8, None).unwrap());
+        assert_eq!(limiter.denied_growth(), 1);
     }
 
     #[test]
@@ -863,9 +921,11 @@ mod tests {
     }
 
     #[test]
-    fn limiter_table_cap_paired_edges() {
+    fn limiter_table_element_cap_paired_edges() {
+        // Issue #74: `table_growing` now consults `max_table_elements`, the
+        // per-table element cap, not the `max_tables` count cap.
         let limits = WasmRuntimeLimits {
-            max_tables: 4,
+            max_table_elements: 4,
             ..Default::default()
         };
         let mut limiter = RuntimeLimiter::new(&limits);

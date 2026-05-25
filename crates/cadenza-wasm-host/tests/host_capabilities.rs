@@ -110,17 +110,9 @@ fn build_plugin() -> PathBuf {
 }
 
 fn runtime() -> ComponentRuntime {
-    // The default `max_tables` (64) is consulted by `RuntimeLimiter` as a
-    // *per-table element* cap (see lib.rs `table_growing`), and a real
-    // component's function table needs more than that. Use a roomier cap so
-    // a genuine component instantiates; capability behaviour is what these
-    // tests exercise, not the resource-limit edges (those live in the unit
-    // tests). The limiter's count/size conflation is tracked in #74.
-    let limits = WasmRuntimeLimits {
-        max_tables: 10_000,
-        ..Default::default()
-    };
-    ComponentRuntime::new(limits).expect("engine init")
+    // `WasmRuntimeLimits::default()` must instantiate a real component
+    // out-of-the-box (issue #74) — no per-test override required.
+    ComponentRuntime::new(WasmRuntimeLimits::default()).expect("engine init")
 }
 
 fn load(rt: &ComponentRuntime) -> cadenza_wasm_host::LoadedComponent {
@@ -155,6 +147,38 @@ fn request_in(root: &std::path::Path) -> RequestContext {
         plugin_name: Some("example".to_string()),
         workspace_path: Some(root.to_path_buf()),
     }
+}
+
+#[test]
+fn real_component_instantiates_under_default_limits() {
+    // Issue #74: a real `wasm32-wasip2` component must instantiate under
+    // `WasmRuntimeLimits::default()` with no per-test override. Previously
+    // `max_tables` was conflated with the per-table element cap, so the
+    // production default (64) denied a real component's function table —
+    // wasmtime reported "table minimum size of 112 elements exceeds table
+    // limits" before any tool code ran. Construct a fresh store from the
+    // default-limit runtime and call `tool.run` to prove instantiation works
+    // end-to-end (a failure here would short-circuit before invocation).
+    let rt = ComponentRuntime::new(WasmRuntimeLimits::default()).expect("engine init");
+    assert_eq!(rt.limits(), &WasmRuntimeLimits::default());
+    let loaded = load(&rt);
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        HostCapabilities {
+            clock: HostClock::Fixed(1),
+            ..Default::default()
+        },
+        serde_json::json!({}),
+    )
+    .expect("default limits must let a real component instantiate and run");
+    // The component returns *some* JSON object on the happy path; the exact
+    // shape is covered by the capability tests below — here we only assert
+    // instantiation reached the tool entry point.
+    let _: serde_json::Value =
+        serde_json::from_str(&out.result_json).expect("tool returned valid JSON");
 }
 
 #[test]
