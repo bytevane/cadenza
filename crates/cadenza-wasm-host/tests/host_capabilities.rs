@@ -110,17 +110,9 @@ fn build_plugin() -> PathBuf {
 }
 
 fn runtime() -> ComponentRuntime {
-    // The default `max_tables` (64) is consulted by `RuntimeLimiter` as a
-    // *per-table element* cap (see lib.rs `table_growing`), and a real
-    // component's function table needs more than that. Use a roomier cap so
-    // a genuine component instantiates; capability behaviour is what these
-    // tests exercise, not the resource-limit edges (those live in the unit
-    // tests). The limiter's count/size conflation is tracked in #74.
-    let limits = WasmRuntimeLimits {
-        max_tables: 10_000,
-        ..Default::default()
-    };
-    ComponentRuntime::new(limits).expect("engine init")
+    // `WasmRuntimeLimits::default()` must instantiate a real component
+    // out-of-the-box (issue #74) — no per-test override required.
+    ComponentRuntime::new(WasmRuntimeLimits::default()).expect("engine init")
 }
 
 fn load(rt: &ComponentRuntime) -> cadenza_wasm_host::LoadedComponent {
@@ -155,6 +147,38 @@ fn request_in(root: &std::path::Path) -> RequestContext {
         plugin_name: Some("example".to_string()),
         workspace_path: Some(root.to_path_buf()),
     }
+}
+
+#[test]
+fn real_component_instantiates_under_default_limits() {
+    // Issue #74: a real `wasm32-wasip2` component must instantiate under
+    // `WasmRuntimeLimits::default()` with no per-test override. Previously
+    // `max_tables` was conflated with the per-table element cap, so the
+    // production default (64) denied a real component's function table —
+    // wasmtime reported "table minimum size of 112 elements exceeds table
+    // limits" before any tool code ran. Construct a fresh store from the
+    // default-limit runtime and call `tool.run` to prove instantiation works
+    // end-to-end (a failure here would short-circuit before invocation).
+    let rt = ComponentRuntime::new(WasmRuntimeLimits::default()).expect("engine init");
+    assert_eq!(rt.limits(), &WasmRuntimeLimits::default());
+    let loaded = load(&rt);
+    let tmp = tempfile::tempdir().unwrap();
+    let out = run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        HostCapabilities {
+            clock: HostClock::Fixed(1),
+            ..Default::default()
+        },
+        serde_json::json!({}),
+    )
+    .expect("default limits must let a real component instantiate and run");
+    // The component returns *some* JSON object on the happy path; the exact
+    // shape is covered by the capability tests below — here we only assert
+    // instantiation reached the tool entry point.
+    let _: serde_json::Value =
+        serde_json::from_str(&out.result_json).expect("tool returned valid JSON");
 }
 
 #[test]
@@ -498,6 +522,44 @@ fn read_limit_truncates() {
     assert_eq!(summary["read"]["truncated"], true);
 }
 
+/// End-to-end proof for issue #75 case 1: a real component whose declared
+/// minimum memory exceeds the host's per-store cap must surface as
+/// `WasmHostError::LimitBreached` at `run_tool` time, NOT `Link`.
+///
+/// The `RuntimeLimiter` signals denial via a typed `ResourceLimitBreached`
+/// payload inside `wasmtime::Error`; wasmtime propagates it through
+/// `ToolRuntime::instantiate`; `classify_instantiate` downcasts it. The
+/// previous classification (`Link`) was misleading — callers wishing to
+/// branch on "the guest tripped a host cap" vs "wiring is broken" had no
+/// reliable signal. This test guards the propagation chain end to end.
+#[test]
+fn instantiation_resource_limit_breach_surfaces_as_limit_breached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let limits = WasmRuntimeLimits {
+        // 4 KiB is well below the example plugin's declared minimum memory
+        // (the Rust std runtime needs at least a few pages just to start), so
+        // wasmtime will consult the limiter at instantiate time and our
+        // `memory_growing` callback will deny it with the typed signal.
+        max_memory_bytes: 4 * 1024,
+        max_tables: 10_000,
+        ..Default::default()
+    };
+    let rt = ComponentRuntime::new(limits).expect("engine init");
+    let loaded = load(&rt);
+    let mut store = rt.new_store_with(request_in(tmp.path()), HostCapabilities::default());
+    let input = ToolInput {
+        name: "demo".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let err = rt
+        .run_tool(&mut store, &loaded, input)
+        .expect_err("instantiation with a 4 KiB memory cap must fail");
+    assert!(
+        matches!(err, WasmHostError::LimitBreached(_)),
+        "issue #75 case 1: over-cap instantiation must classify as LimitBreached, got {err:?}",
+    );
+}
+
 /// Issue #63, path 3: instance/table COUNT-cap denials are deliberately
 /// excluded from the limiter's denial telemetry. Wasmtime enforces the
 /// instance-count cap during instantiation (`bump_resource_counts`) and never
@@ -511,8 +573,10 @@ fn read_limit_truncates() {
 #[test]
 fn count_cap_denial_surfaces_as_link_and_leaves_counters_untouched() {
     let limits = WasmRuntimeLimits {
-        // Roomy table cap so per-table growth (which shares this field) does
-        // not trip first; the point here is the instance COUNT cap.
+        // Roomy table *count* cap so it does not trip before the instance
+        // count cap. Per-table element growth is governed by the separate
+        // `max_table_elements` (default, roomy) since #74, so the count caps
+        // are isolated here; the point is the instance COUNT cap.
         max_tables: 10_000,
         max_instances: 1,
         ..Default::default()

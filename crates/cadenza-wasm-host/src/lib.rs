@@ -44,7 +44,22 @@ pub const WIT_WORLD: &str = "tool-runtime";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WasmRuntimeLimits {
     pub max_memory_bytes: usize,
+    /// Cap on the **count** of tables a component may allocate. Wasmtime's
+    /// default is 10_000; consulted by [`ResourceLimiter::tables`] at
+    /// allocation time. Distinct from [`Self::max_table_elements`], which
+    /// caps the per-table element count consulted at growth time.
     pub max_tables: usize,
+    /// Cap on the **element count** of any single table consulted by
+    /// [`ResourceLimiter::table_growing`]. A real `wasm32-wasip2` component's
+    /// function table can carry hundreds of entries, so this default must be
+    /// roomier than [`Self::max_tables`] for a genuine component to
+    /// instantiate (issue #74).
+    ///
+    /// Defaulted in serde so an existing config that predates the field
+    /// continues to deserialize — making the wire shape backwards-compatible
+    /// even though no in-tree consumer deserializes `WasmRuntimeLimits` yet.
+    #[serde(default = "default_max_table_elements")]
+    pub max_table_elements: usize,
     pub max_instances: usize,
     pub epoch_timeout_ms: u64,
     pub max_http_body_bytes: usize,
@@ -55,11 +70,22 @@ impl Default for WasmRuntimeLimits {
         Self {
             max_memory_bytes: 64 * 1024 * 1024,
             max_tables: 64,
+            max_table_elements: default_max_table_elements(),
             max_instances: 16,
             epoch_timeout_ms: 5_000,
             max_http_body_bytes: 2 * 1024 * 1024,
         }
     }
+}
+
+/// Default per-table element cap. Generous enough that a real
+/// `wasm32-wasip2` component instantiates under the default — its function
+/// table can carry hundreds of entries, and the previous conflation with
+/// `max_tables = 64` denied instantiation outright (issue #74). Factored out
+/// so `#[serde(default = ...)]` on `WasmRuntimeLimits::max_table_elements`
+/// can reuse the same value.
+fn default_max_table_elements() -> usize {
+    10_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +94,44 @@ pub struct WasmComponentRef {
     pub path: PathBuf,
     pub wit_package: String,
     pub wit_world: String,
+}
+
+/// Typed signal that the `RuntimeLimiter` denied an allocation that
+/// `Wasmtime` consulted it about. Returned from `memory_growing` /
+/// `table_growing` as the inner payload of a `wasmtime::Error` so the host can
+/// downcast at `classify_instantiate`/`classify_trap` time and surface
+/// `WasmHostError::LimitBreached` instead of the less-precise `Link`
+/// classification a plain string error would land on (issue #75).
+///
+/// This carries the (current, desired, cap) triple so a future audit log can
+/// record the precise growth attempt that tripped the cap. The trait method
+/// can only signal denial-or-not (no `format!` payload), so a typed struct is
+/// the only non-string-matching channel for the cause.
+#[derive(Debug, thiserror::Error)]
+#[error("guest cap breached: {kind} growth from {current} to {desired} denied (host cap {cap})")]
+pub(crate) struct ResourceLimitBreached {
+    pub kind: &'static str,
+    pub current: usize,
+    pub desired: usize,
+    pub cap: usize,
+}
+
+/// Typed signal that the guest invoked an import the host did not link — i.e.
+/// a deferred capability such as `host-http` / `host-tools` (and any future
+/// interface not yet wired in `add_host_capabilities`). Returned by the
+/// per-import stub installed by [`define_imports_as_capability_denied`] as the
+/// inner payload of a `wasmtime::Error` so `classify_trap` can downcast and
+/// surface `WasmHostError::CapabilityDenied` instead of the less-precise
+/// `LimitBreached` a generic trap would land on (issue #75).
+///
+/// `interface` is the WIT instance name (e.g. `cadenza:runtime/host-http`)
+/// and `item` is the function name within it — together they form the path the
+/// audit log records when a denial is surfaced.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("capability denied: deferred host import `{interface}#{item}`")]
+pub(crate) struct DeferredCapability {
+    pub interface: String,
+    pub item: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -393,6 +457,14 @@ impl LogSink {
 /// plus two **separate, monotonic** denial-telemetry counters so
 /// operators/tests can distinguish *why* a guest was constrained.
 ///
+/// `max_tables` and `max_table_elements` are deliberately distinct: the
+/// former bounds the *count* of tables a component may allocate (consulted
+/// by [`ResourceLimiter::tables`] at allocation time), the latter bounds the
+/// *element count* of any single table (consulted by
+/// [`ResourceLimiter::table_growing`] at growth time). They were previously
+/// conflated, which denied a real `wasm32-wasip2` component instantiation
+/// under the production default (issue #74).
+///
 /// ## Denial telemetry contract (issue #63)
 ///
 /// Wasmtime exposes resource constraints to a [`ResourceLimiter`] through
@@ -401,14 +473,15 @@ impl LogSink {
 /// neither is mistaken for "all resource denials":
 ///
 /// - [`RuntimeLimiter::denied_growth`] — growth the *limiter itself*
-///   refused: `memory_growing` / `table_growing` returned `Ok(false)`
-///   because `desired` exceeded the configured size cap. This is a
-///   limiter decision.
+///   refused: `memory_growing` / `table_growing` saw `desired` exceed the
+///   configured size cap. This is a limiter decision; the denial surfaces to
+///   the caller as a typed `Err(ResourceLimitBreached)` (issue #75), but the
+///   counter ticks on the same path regardless of how it surfaces.
 /// - [`RuntimeLimiter::grow_failed_after_allow`] — growth the limiter
 ///   *allowed* (`Ok(true)`) that Wasmtime then failed anyway: the request
 ///   exceeded the wasm-declared `maximum`, or the OS could not allocate.
 ///   These arrive via the `memory_grow_failed` / `table_grow_failed`
-///   callbacks, never via the `Ok(false)` path, so they are tracked apart
+///   callbacks, never via the limiter-denial path, so they are tracked apart
 ///   from limiter decisions.
 ///
 /// **Explicitly out of scope: instance/table *count*-cap denials.**
@@ -424,6 +497,7 @@ impl LogSink {
 pub struct RuntimeLimiter {
     max_memory_bytes: usize,
     max_tables: usize,
+    max_table_elements: usize,
     max_instances: usize,
     denied_growth: usize,
     grow_failed_after_allow: usize,
@@ -434,6 +508,7 @@ impl RuntimeLimiter {
         Self {
             max_memory_bytes: limits.max_memory_bytes,
             max_tables: limits.max_tables,
+            max_table_elements: limits.max_table_elements,
             max_instances: limits.max_instances,
             denied_growth: 0,
             grow_failed_after_allow: 0,
@@ -441,10 +516,11 @@ impl RuntimeLimiter {
     }
 
     /// Count of growth requests the **limiter denied**: `memory_growing` or
-    /// `table_growing` returned `Ok(false)` because `desired` exceeded the
-    /// configured size cap. Does NOT include growths that failed *after* the
-    /// limiter allowed them (see [`RuntimeLimiter::grow_failed_after_allow`])
-    /// nor instance/table count-cap denials (see the type-level contract).
+    /// `table_growing` saw `desired` exceed the configured size cap (the
+    /// denial surfaces to the caller as a typed `Err(ResourceLimitBreached)`,
+    /// issue #75). Does NOT include growths that failed *after* the limiter
+    /// allowed them (see [`RuntimeLimiter::grow_failed_after_allow`]) nor
+    /// instance/table count-cap denials (see the type-level contract).
     pub fn denied_growth(&self) -> usize {
         self.denied_growth
     }
@@ -467,44 +543,69 @@ impl RuntimeLimiter {
         self.max_tables
     }
 
+    pub fn max_table_elements(&self) -> usize {
+        self.max_table_elements
+    }
+
     pub fn max_instances(&self) -> usize {
         self.max_instances
     }
 }
 
 impl ResourceLimiter for RuntimeLimiter {
+    /// Denials surface as a typed `Err(ResourceLimitBreached)` rather than
+    /// `Ok(false)` so the host can downcast at `classify_instantiate` /
+    /// `classify_trap` time and label the error as `LimitBreached` instead of
+    /// the less-precise `Link` (issue #75). Per the `ResourceLimiter` contract,
+    /// an `Err` return also turns a runtime `memory.grow` into a trap rather
+    /// than a `-1` return — that is a deliberate fail-closed hardening: a
+    /// guest exceeding the host's cap MUST be visible to the host, not a soft
+    /// failure the guest silently routes around.
     fn memory_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         if desired > self.max_memory_bytes {
             self.denied_growth = self.denied_growth.saturating_add(1);
-            return Ok(false);
+            return Err(wasmtime::Error::new(ResourceLimitBreached {
+                kind: "memory",
+                current,
+                desired,
+                cap: self.max_memory_bytes,
+            }));
         }
         Ok(true)
     }
 
     fn table_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        if desired > self.max_tables {
+        // Per-table element cap. Distinct from the table *count* cap returned
+        // by `tables()` — previously these were conflated, which denied a
+        // real component's function table at instantiation (issue #74).
+        if desired > self.max_table_elements {
             self.denied_growth = self.denied_growth.saturating_add(1);
-            return Ok(false);
+            return Err(wasmtime::Error::new(ResourceLimitBreached {
+                kind: "table",
+                current,
+                desired,
+                cap: self.max_table_elements,
+            }));
         }
         Ok(true)
     }
 
     /// A memory growth this limiter ALLOWED (`Ok(true)`) that Wasmtime then
     /// failed (exceeds the wasm-declared `maximum`, or OS allocation failure).
-    /// Counted in `grow_failed_after_allow` — distinct from the `Ok(false)`
-    /// limiter-denial path (issue #63). Returns `Ok(())` to preserve the trait
-    /// default's guest-visible behaviour (the `memory.grow` instruction yields
-    /// -1); we only observe, we do not change the outcome.
+    /// Counted in `grow_failed_after_allow` — distinct from the typed-`Err`
+    /// limiter-denial path (issue #63 / #75). Returns `Ok(())` to preserve the
+    /// trait default's guest-visible behaviour (the `memory.grow` instruction
+    /// yields -1); we only observe, we do not change the outcome.
     fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
         self.grow_failed_after_allow = self.grow_failed_after_allow.saturating_add(1);
         Ok(())
@@ -529,8 +630,9 @@ impl ResourceLimiter for RuntimeLimiter {
 
     /// Cap on the number of tables a component can allocate. Same story
     /// as `instances()` — wasmtime defaults to 10_000 here too, so
-    /// without this override `max_tables` only constrains the growth of
-    /// each individual table, not how many tables exist (PR #52 codex P2).
+    /// without this override `max_tables` would be unenforced at allocation
+    /// time (PR #52 codex P2). The per-table element cap is independent and
+    /// consulted by `table_growing` via `max_table_elements` (issue #74).
     fn tables(&self) -> usize {
         self.max_tables
     }
@@ -754,11 +856,16 @@ impl std::fmt::Debug for LoadedComponent {
     }
 }
 
-/// Helper for converting a wasmtime trap into our typed timeout when
-/// the trap kind was an epoch interruption. Other trap kinds map to
-/// `LimitBreached` so the orchestrator can branch on the cause.
+/// Convert a wasmtime call-time error into our typed host error. Precedence:
+/// a `DeferredCapability` payload (the typed signal a deferred-import stub
+/// emits) surfaces as `CapabilityDenied`; an epoch interruption surfaces as
+/// `Timeout`; any other trap or non-trap call-time failure collapses to
+/// `LimitBreached` so the orchestrator can branch on the cause (issue #75).
 pub fn classify_trap(err: wasmtime::Error) -> WasmHostError {
     use wasmtime::Trap;
+    if let Some(denial) = err.downcast_ref::<DeferredCapability>() {
+        return WasmHostError::CapabilityDenied(denial.to_string());
+    }
     if let Some(trap) = err.downcast_ref::<Trap>() {
         if matches!(*trap, Trap::Interrupt) {
             return WasmHostError::Timeout;
@@ -857,6 +964,12 @@ mod tests {
             runtime.limits().max_memory_bytes
         );
         assert_eq!(data.limiter.max_tables(), runtime.limits().max_tables);
+        // Issue #74: per-table element cap must flow through the limiter
+        // independently of the table-count cap.
+        assert_eq!(
+            data.limiter.max_table_elements(),
+            runtime.limits().max_table_elements
+        );
         // PR #52 codex P1: max_instances must flow through the limiter
         // since StoreLimits is gone.
         assert_eq!(data.limiter.max_instances(), runtime.limits().max_instances);
@@ -877,10 +990,8 @@ mod tests {
 
     #[test]
     fn limiter_reports_tables_cap_to_wasmtime() {
-        // PR #52 codex P2: `table_growing` only constrains individual
-        // table growth, not the *count* of tables a component can
-        // allocate. The trait's `tables()` method must return the
-        // configured cap so wasmtime enforces it at allocation time.
+        // PR #52 codex P2: the trait's `tables()` method must return the
+        // configured *count* cap so wasmtime enforces it at allocation time.
         // Default trait impl returns 10_000.
         let limits = WasmRuntimeLimits {
             max_tables: 5,
@@ -888,6 +999,55 @@ mod tests {
         };
         let limiter = RuntimeLimiter::new(&limits);
         assert_eq!(ResourceLimiter::tables(&limiter), 5);
+    }
+
+    #[test]
+    fn limits_deserialize_tolerates_missing_max_table_elements() {
+        // Issue #74: the new `max_table_elements` field must round-trip from
+        // a config that predates it. Without `#[serde(default)]`, an old
+        // config omitting the field would fail to deserialize. The default
+        // must agree with `Default::default()` so callers see one value.
+        let json = r#"{
+            "max_memory_bytes": 1024,
+            "max_tables": 8,
+            "max_instances": 4,
+            "epoch_timeout_ms": 100,
+            "max_http_body_bytes": 2048
+        }"#;
+        let limits: WasmRuntimeLimits =
+            serde_json::from_str(json).expect("legacy json deserializes");
+        assert_eq!(
+            limits.max_table_elements,
+            WasmRuntimeLimits::default().max_table_elements,
+            "missing field must default to the same value Default::default uses",
+        );
+        assert_eq!(limits.max_tables, 8);
+    }
+
+    #[test]
+    fn limiter_table_count_and_element_caps_are_independent() {
+        // Issue #74 regression: the table *count* cap (`tables()`) and the
+        // per-table *element* cap (`table_growing`) must be configurable
+        // independently. A snug count cap of 1 must not prevent a single
+        // real table from growing past it, and vice versa: a snug element
+        // cap of 16 must not affect `tables()`.
+        let limits = WasmRuntimeLimits {
+            max_tables: 1,
+            max_table_elements: 16,
+            ..Default::default()
+        };
+        let mut limiter = RuntimeLimiter::new(&limits);
+        assert_eq!(ResourceLimiter::tables(&limiter), 1);
+        // Element cap, NOT count cap, governs growth: 64 > 16 must deny. Per
+        // #75 the denial surfaces as a typed `ResourceLimitBreached`, not
+        // `Ok(false)`.
+        let err = limiter
+            .table_growing(0, 64, None)
+            .expect_err("over-element-cap growth must surface a typed error");
+        assert!(err.downcast_ref::<ResourceLimitBreached>().is_some());
+        // And 8 ≤ 16 must allow even though 8 ≥ max_tables.
+        assert!(limiter.table_growing(0, 8, None).unwrap());
+        assert_eq!(limiter.denied_growth(), 1);
     }
 
     #[test]
@@ -916,6 +1076,8 @@ mod tests {
 
     #[test]
     fn limiter_allows_at_cap_and_denies_above_cap() {
+        // Paired-edge: exact-cap requests pass with `Ok(true)`; any byte over
+        // surfaces a typed denial that classify_instantiate downcasts (#75).
         let limits = WasmRuntimeLimits {
             max_memory_bytes: 1_024,
             ..Default::default()
@@ -923,19 +1085,29 @@ mod tests {
         let mut limiter = RuntimeLimiter::new(&limits);
         assert!(limiter.memory_growing(0, 1_024, None).unwrap());
         assert_eq!(limiter.denied_growth(), 0);
-        assert!(!limiter.memory_growing(0, 1_025, None).unwrap());
+        let err = limiter
+            .memory_growing(0, 1_025, None)
+            .expect_err("over-cap must error, not Ok(false)");
+        assert!(err.downcast_ref::<ResourceLimitBreached>().is_some());
         assert_eq!(limiter.denied_growth(), 1);
     }
 
     #[test]
-    fn limiter_table_cap_paired_edges() {
+    fn limiter_table_element_cap_paired_edges() {
+        // Issue #74: `table_growing` consults `max_table_elements` (the
+        // per-table element cap), not the `max_tables` count cap. Issue #75:
+        // an over-cap request surfaces a typed `ResourceLimitBreached` denial
+        // that classify_instantiate downcasts, rather than `Ok(false)`.
         let limits = WasmRuntimeLimits {
-            max_tables: 4,
+            max_table_elements: 4,
             ..Default::default()
         };
         let mut limiter = RuntimeLimiter::new(&limits);
         assert!(limiter.table_growing(0, 4, None).unwrap());
-        assert!(!limiter.table_growing(0, 5, None).unwrap());
+        let err = limiter
+            .table_growing(0, 5, None)
+            .expect_err("over-cap must error, not Ok(false)");
+        assert!(err.downcast_ref::<ResourceLimitBreached>().is_some());
         assert_eq!(limiter.denied_growth(), 1);
     }
 
@@ -984,6 +1156,90 @@ mod tests {
         // absent and the orchestrator passes credentials via host
         // functions that never copy raw values into guest memory.
         let _ = RequestContext::default();
+    }
+
+    // issue #75: instantiation-time resource-limit breaches must surface as
+    // `LimitBreached`, not the less-precise `Link`. The limiter signals denial
+    // via a typed `ResourceLimitBreached` payload inside `wasmtime::Error`;
+    // `classify_instantiate` must downcast that payload.
+    #[test]
+    fn classify_instantiate_maps_typed_limit_breach_to_limit_breached() {
+        let err = wasmtime::Error::new(ResourceLimitBreached {
+            kind: "memory",
+            current: 0,
+            desired: 1_048_576,
+            cap: 1_024,
+        });
+        let classified = crate::capabilities::classify_instantiate(err);
+        assert!(
+            matches!(classified, WasmHostError::LimitBreached(_)),
+            "got {classified:?}",
+        );
+    }
+
+    // issue #75: a guest call into a deferred (not-linked) host import must
+    // surface as `CapabilityDenied`, not `LimitBreached`. The unknown-import
+    // stub signals the denial via a typed `DeferredCapability` payload inside
+    // `wasmtime::Error`; `classify_trap` must downcast that payload.
+    #[test]
+    fn classify_trap_maps_typed_deferred_capability_to_capability_denied() {
+        let err = wasmtime::Error::new(DeferredCapability {
+            interface: "cadenza:runtime/host-http".to_string(),
+            item: "fetch".to_string(),
+        });
+        let classified = classify_trap(err);
+        assert!(
+            matches!(classified, WasmHostError::CapabilityDenied(_)),
+            "got {classified:?}",
+        );
+    }
+
+    // issue #75: when wasmtime asks the limiter to authorize a growth that
+    // exceeds our cap, we MUST return a typed `Err(ResourceLimitBreached)`
+    // rather than `Ok(false)`. This is the signal `classify_instantiate`
+    // downcasts on; without it the path lands on `Link` (issue #75 case 1).
+    #[test]
+    fn limiter_returns_typed_error_when_memory_cap_exceeded() {
+        let limits = WasmRuntimeLimits {
+            max_memory_bytes: 1_024,
+            ..Default::default()
+        };
+        let mut limiter = RuntimeLimiter::new(&limits);
+        let err = limiter
+            .memory_growing(0, 1_025, None)
+            .expect_err("over-cap memory growth must surface a typed error");
+        let signal = err
+            .downcast_ref::<ResourceLimitBreached>()
+            .expect("error must carry a ResourceLimitBreached payload");
+        assert_eq!(signal.kind, "memory");
+        assert_eq!(signal.desired, 1_025);
+        assert_eq!(signal.cap, 1_024);
+        // The denied_growth counter remains useful observability — it must
+        // still tick on each denial so an operator can audit aggregate
+        // pressure even when individual breaches surface upstream.
+        assert_eq!(limiter.denied_growth(), 1);
+    }
+
+    #[test]
+    fn limiter_returns_typed_error_when_table_cap_exceeded() {
+        // `table_growing` consults the per-table element cap (#74), so the
+        // breach is configured via `max_table_elements`; the typed payload's
+        // `cap` reflects that same value (#75).
+        let limits = WasmRuntimeLimits {
+            max_table_elements: 4,
+            ..Default::default()
+        };
+        let mut limiter = RuntimeLimiter::new(&limits);
+        let err = limiter
+            .table_growing(0, 5, None)
+            .expect_err("over-cap table growth must surface a typed error");
+        let signal = err
+            .downcast_ref::<ResourceLimitBreached>()
+            .expect("error must carry a ResourceLimitBreached payload");
+        assert_eq!(signal.kind, "table");
+        assert_eq!(signal.desired, 5);
+        assert_eq!(signal.cap, 4);
+        assert_eq!(limiter.denied_growth(), 1);
     }
 
     #[test]

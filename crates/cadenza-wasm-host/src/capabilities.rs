@@ -28,11 +28,11 @@ use std::io::{Read, Seek, SeekFrom};
 
 use camino::Utf8Path;
 use wasmtime::Store;
-use wasmtime::component::{HasSelf, Linker};
+use wasmtime::component::{HasSelf, Linker, types::ComponentItem};
 
 use crate::{
-    ComponentRuntime, HostLogRecord, LinearCall, LinearMode, LinearTransportError, LoadedComponent,
-    StoreState, WasmHostError,
+    ComponentRuntime, DeferredCapability, HostLogRecord, LinearCall, LinearMode,
+    LinearTransportError, LoadedComponent, StoreState, WasmHostError,
 };
 
 wasmtime::component::bindgen!({
@@ -43,6 +43,112 @@ wasmtime::component::bindgen!({
 pub use cadenza::runtime::types::{
     GraphqlMode, GraphqlResponse, HostError, LogLevel, ToolInput, ToolOutput, WorkspaceReadResult,
 };
+
+/// Stub every import of `component` so the guest is granted nothing by
+/// default: each *function* import becomes a host function that returns a
+/// typed [`DeferredCapability`] error, while resources and nested instances
+/// get the structural stubs wasmtime's instantiation type-check requires.
+/// This mirrors wasmtime's own `Linker::define_unknown_imports_as_traps`, but
+/// the error payload is downcastable in [`classify_trap`] so a guest call into
+/// a deferred capability (`host-http`, `host-tools`, or any incidental WASI
+/// import the rustc-emitted Rust runtime drags in) surfaces as
+/// `WasmHostError::CapabilityDenied` rather than the less-precise
+/// `LimitBreached` a stringly-typed trap would land on (issue #75 case 2).
+///
+/// We do the full recursion ourselves rather than calling
+/// `define_unknown_imports_as_traps` and overriding afterwards: re-entering an
+/// instance namespace with `Linker::instance` inserts a *fresh* empty
+/// namespace (it does not append), which would discard the resource stubs
+/// wasmtime had installed for instances like `wasi:io/poll` and break the
+/// instantiation type-check.
+///
+/// Pre-condition: `linker.allow_shadowing(true)` must be in effect (set by the
+/// caller in `run_tool`); [`add_host_capabilities`] then shadows the in-scope
+/// interfaces with their real implementations.
+fn define_imports_as_capability_denied(
+    linker: &mut Linker<StoreState>,
+    component: &wasmtime::component::Component,
+    engine: &wasmtime::Engine,
+) -> Result<(), WasmHostError> {
+    let mut root = linker.root();
+    for (import_name, import_item) in component.component_type().imports(engine) {
+        stub_import_item(&mut root, import_name, &import_item, "", engine)?;
+    }
+    Ok(())
+}
+
+/// Recursively stub a single import item into `linker_instance`. `interface`
+/// is the dotted path of the *parent* instance (empty at the root) so a
+/// function stub can carry the precise `(interface, item)` pair in its
+/// [`DeferredCapability`] payload.
+fn stub_import_item(
+    linker_instance: &mut wasmtime::component::LinkerInstance<'_, StoreState>,
+    item_name: &str,
+    item: &ComponentItem,
+    interface: &str,
+    engine: &wasmtime::Engine,
+) -> Result<(), WasmHostError> {
+    let link_err = |e: wasmtime::Error| WasmHostError::Link(e.to_string());
+    match item {
+        // A function — the only guest-callable item. Stub it with the typed
+        // capability-denied payload so `classify_trap` can label it precisely.
+        ComponentItem::ComponentFunc(_) => {
+            let denial = DeferredCapability {
+                interface: interface.to_string(),
+                item: item_name.to_string(),
+            };
+            linker_instance
+                .func_new(item_name, move |_store, _ty, _params, _results| {
+                    Err(wasmtime::Error::new(denial.clone()))
+                })
+                .map_err(link_err)?;
+        }
+        // A nested WIT interface — recurse so its functions/resources are
+        // stubbed too. `Linker::instance` inserts the namespace fresh, so this
+        // is the *only* pass that touches it.
+        ComponentItem::ComponentInstance(instance) => {
+            let nested_interface = if interface.is_empty() {
+                item_name.to_string()
+            } else {
+                format!("{interface}/{item_name}")
+            };
+            let mut nested = linker_instance.instance(item_name).map_err(link_err)?;
+            for (export_name, export_item) in instance.exports(engine) {
+                stub_import_item(
+                    &mut nested,
+                    export_name,
+                    &export_item,
+                    &nested_interface,
+                    engine,
+                )?;
+            }
+        }
+        // A resource type — not callable, but the instantiation type-check
+        // requires a matching host resource definition (e.g. `wasi:io/poll`'s
+        // `pollable`). The destructor is a no-op: the guest never obtains a
+        // live handle because every function that would mint one is stubbed.
+        ComponentItem::Resource(_) => {
+            linker_instance
+                .resource(
+                    item_name,
+                    wasmtime::component::ResourceType::host::<()>(),
+                    |_store, _rep| Ok(()),
+                )
+                .map_err(link_err)?;
+        }
+        // Core modules and sub-components cannot be stubbed; cadenza's world
+        // never imports them, so reaching here means a malformed component.
+        ComponentItem::Module(_) | ComponentItem::Component(_) => {
+            return Err(WasmHostError::Link(format!(
+                "cannot stub import `{item_name}`: core module / sub-component imports are unsupported"
+            )));
+        }
+        // Core functions and bare interface types are not guest call sites and
+        // need no linker definition.
+        ComponentItem::CoreFunc(_) | ComponentItem::Type(_) => {}
+    }
+    Ok(())
+}
 
 /// Wire the in-scope host interfaces into `linker` (`host-log`, `host-time`,
 /// `host-workspace`, `host-secrets`, `host-linear`). The guest's incidental
@@ -85,17 +191,25 @@ impl ComponentRuntime {
         // store's age (issue #62 review follow-up).
         store.set_epoch_deadline(self.epoch_budget_ticks());
         let mut linker = Linker::<StoreState>::new(self.engine());
-        // Stub *every* import as a trap first, then shadow the in-scope host
-        // interfaces with their real implementations. The guest's incidental
-        // WASI imports (from the Rust std runtime) therefore grant nothing —
-        // no preopens, env, clocks, random, sockets, or filesystem reach the
-        // guest; a guest that calls a WASI function traps (surfaced via
-        // `classify_trap`). The only live capabilities are the linked host
-        // functions, satisfying the issue's "minimal capability" requirement.
+        // Stub *every* import first, then shadow the in-scope host interfaces
+        // with their real implementations. The guest's incidental WASI
+        // imports (from the Rust std runtime) therefore grant nothing — no
+        // preopens, env, clocks, random, sockets, or filesystem reach the
+        // guest, and a deferred host interface (`host-http` / `host-tools`)
+        // is not callable either. The only live capabilities are the linked
+        // host functions, satisfying the issue's "minimal capability"
+        // requirement.
+        //
+        // `define_imports_as_capability_denied` does the stubbing: it walks
+        // the component's full import tree and gives each *function* import a
+        // typed `DeferredCapability` closure, so a guest call into a deferred
+        // capability surfaces in `classify_trap` as
+        // `WasmHostError::CapabilityDenied` rather than the less-precise
+        // `LimitBreached` a stringly-typed trap would land on (issue #75 case
+        // 2). It deliberately does NOT use wasmtime's own
+        // `define_unknown_imports_as_traps` — see that function's doc for why.
         linker.allow_shadowing(true);
-        linker
-            .define_unknown_imports_as_traps(&loaded.component)
-            .map_err(|e| WasmHostError::Link(e.to_string()))?;
+        define_imports_as_capability_denied(&mut linker, &loaded.component, self.engine())?;
         add_host_capabilities(&mut linker)?;
         linker.allow_shadowing(false);
         let bindings = ToolRuntime::instantiate(&mut *store, &loaded.component, &linker)
@@ -552,11 +666,28 @@ fn read_window<R: Read + Seek>(
 }
 
 /// Map a `ToolRuntime::instantiate` failure onto a typed host error.
-/// Instantiation can fail either because the linker is missing wiring (a
-/// `Link` problem) or because guest initialization code traps / breaches a
-/// resource limit; the latter must surface as `Timeout`/`LimitBreached` so
-/// callers can branch on the cause.
-fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
+/// Instantiation can fail four different ways: (a) the linker was missing
+/// wiring (a `Link` problem), (b) guest init code traps with an epoch
+/// interruption (`Timeout`), (c) the host limiter denied an allocation via
+/// the typed `ResourceLimitBreached` signal (`LimitBreached` — issue #75 case
+/// 1), or (d) a deferred-capability stub was invoked during initialization
+/// (`CapabilityDenied`). Downcasting the typed payloads first means an over-cap
+/// declared memory/table no longer mislabels as `Link`, and a deferred host
+/// import called during init no longer mislabels as `LimitBreached`.
+///
+/// One resource-limit sub-case is deliberately left as `Link`: a *count*-cap
+/// breach (too many instances/tables/memories, enforced by wasmtime via
+/// `Store::bump_resource_counts`) bails with a plain string and carries no
+/// typed payload or `Trap` in wasmtime 45, so there is no non-fragile signal
+/// to downcast. Fixing that precisely needs upstream support and is out of
+/// scope for #75 (whose example is the size-growth path handled above).
+pub(crate) fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
+    if let Some(breach) = err.downcast_ref::<crate::ResourceLimitBreached>() {
+        return WasmHostError::LimitBreached(breach.to_string());
+    }
+    if err.downcast_ref::<crate::DeferredCapability>().is_some() {
+        return crate::classify_trap(err);
+    }
     if err.downcast_ref::<wasmtime::Trap>().is_some() {
         crate::classify_trap(err)
     } else {
@@ -819,6 +950,62 @@ mod tests {
             classify_instantiate(err),
             WasmHostError::LimitBreached(_)
         ));
+    }
+
+    // End-to-end proof for issue #75 case 2: a guest that calls an import the
+    // host did not link must surface as `CapabilityDenied`, not `LimitBreached`.
+    // This drives a minimal hand-written component (no plugin build needed)
+    // whose exported `go` calls an unlinked root import; `define_imports_as_
+    // capability_denied` stubs that import with the typed payload, and a real
+    // guest→host call must propagate it so `classify_trap` maps it precisely.
+    #[test]
+    fn deferred_import_call_surfaces_as_capability_denied() {
+        use wasmtime::component::{Component, Linker};
+
+        // A component that imports a single root-level function `run-deferred`
+        // and exports `go`, which calls it. `run-deferred` is never linked by
+        // a real host capability, so our stub is what answers the call.
+        const WAT: &str = r#"
+            (component
+              (import "run-deferred" (func $deferred))
+              (core func $deferred-core (canon lower (func $deferred)))
+              (core module $m
+                (import "host" "deferred" (func $d))
+                (func (export "go") call $d)
+              )
+              (core instance $i (instantiate $m
+                (with "host" (instance (export "deferred" (func $deferred-core))))
+              ))
+              (func (export "go") (canon lift (core func $i "go")))
+            )
+        "#;
+
+        let runtime = crate::ComponentRuntime::new(crate::WasmRuntimeLimits::default()).unwrap();
+        let component = Component::new(runtime.engine(), WAT).expect("compile wat component");
+
+        let mut linker = Linker::<StoreState>::new(runtime.engine());
+        linker.allow_shadowing(true);
+        define_imports_as_capability_denied(&mut linker, &component, runtime.engine())
+            .expect("stub imports");
+
+        let mut store = runtime.new_store(crate::RequestContext::default());
+        let instance = linker
+            .instantiate(&mut store, &component)
+            .expect("instantiate stubbed component");
+        let go = instance
+            .get_typed_func::<(), ()>(&mut store, "go")
+            .expect("export go");
+
+        let err = go
+            .call(&mut store, ())
+            .expect_err("calling an unlinked import must fail");
+        // The typed payload must survive the guest→host boundary so the host
+        // can classify it precisely rather than as a generic limit breach.
+        let classified = crate::classify_trap(err);
+        assert!(
+            matches!(classified, WasmHostError::CapabilityDenied(_)),
+            "deferred import call must classify as CapabilityDenied, got {classified:?}",
+        );
     }
 
     // Guards the symlink half of containment specifically: lexical `safe_join`
