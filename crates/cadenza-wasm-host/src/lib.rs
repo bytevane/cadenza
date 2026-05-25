@@ -188,6 +188,13 @@ pub struct LinearCall {
     pub mode: LinearMode,
     /// The host-configured endpoint, already checked against the allowlist.
     pub endpoint: String,
+    /// Max bytes the transport should read for the response body. A correct
+    /// transport MUST bound its read to this (e.g. a capped/streaming read
+    /// that aborts once exceeded) so an oversized upstream response cannot
+    /// exhaust host memory before it is even returned. The capability also
+    /// re-checks the returned body length as a backstop for the guest-memory
+    /// boundary, but only the transport can bound its own allocation.
+    pub max_response_bytes: usize,
 }
 
 /// Raw transport result for a Linear GraphQL call. A completed HTTP exchange

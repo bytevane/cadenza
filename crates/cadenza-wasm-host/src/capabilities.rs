@@ -277,14 +277,16 @@ impl StoreState {
             variables_json: normalised_vars,
             mode,
             endpoint: cap.endpoint().to_string(),
+            // Hand the limit to the transport so it can bound its own read and
+            // never materialise an oversized body host-side.
+            max_response_bytes: self.http_body_limit,
         };
         match cap.transport().execute(call) {
             Ok(res) => {
-                // Bound the response body crossing into guest memory by the
-                // runtime's configured `max_http_body_bytes`. A transport or
-                // upstream returning an oversized body fails with a typed error
-                // rather than forcing a large host allocation / guest-memory
-                // breach.
+                // Backstop: even if the transport over-read, refuse to hand a
+                // body larger than `max_http_body_bytes` across to guest
+                // memory. Bounding the host-side allocation itself is the
+                // transport's responsibility (see `LinearCall::max_response_bytes`).
                 if res.body_json.len() > self.http_body_limit {
                     return Err(HostError::Upstream(format!(
                         "linear response body exceeds the configured limit of {} bytes",
@@ -1053,6 +1055,12 @@ mod tests {
         assert_eq!(calls[0].operation_name.as_deref(), Some("Viewer"));
         assert_eq!(calls[0].endpoint, LinearCapability::DEFAULT_ENDPOINT);
         assert_eq!(calls[0].variables_json, r#"{"first":1}"#);
+        // The runtime's response-size limit is handed to the transport so it
+        // can bound its own read.
+        assert_eq!(
+            calls[0].max_response_bytes,
+            WasmRuntimeLimits::default().max_http_body_bytes
+        );
 
         // Audit carries operation name, fingerprint, duration, and mode; no
         // error on the success path.

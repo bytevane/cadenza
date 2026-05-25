@@ -92,12 +92,15 @@ example plugin exercise it. Several frozen contracts sit in the blast radius:
    a GraphQL `errors` array) is returned as `graphql-response` (status +
    body-json); only HTTP/transport-level failures become `host-error`.
 
-8. **Bounded response body + validated variables.** The GraphQL response body
-   handed back to the guest is bounded by the runtime's existing
-   `max_http_body_bytes`; an oversized upstream body fails with a typed
-   `upstream` error rather than forcing a large host allocation or breaching
-   guest memory. `variables-json` must be a JSON **object** (a GraphQL
-   variables map), not just any valid JSON; empty input normalises to `{}`.
+8. **Bounded response body + validated variables.** The runtime's existing
+   `max_http_body_bytes` is delivered to the transport via
+   `LinearCall::max_response_bytes` so a correct transport bounds its own read
+   and never materialises an oversized body host-side (the only place that
+   allocation can be bounded). The capability also re-checks the returned body
+   length as a backstop for the guest-memory boundary — an oversized body
+   fails with a typed `upstream` error rather than crossing into guest memory.
+   `variables-json` must be a JSON **object** (a GraphQL variables map), not
+   just any valid JSON; empty input normalises to `{}`.
 
 9. **Audit with canonical, redacted fields.** Every `linear-graphql` call —
    success, denial, or error — records one host-call log entry stamped with
