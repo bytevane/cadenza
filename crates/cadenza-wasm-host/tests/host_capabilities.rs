@@ -13,13 +13,47 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cadenza_obs::Scrubber;
 use cadenza_wasm_host::{
-    ComponentRuntime, HostCapabilities, HostClock, HostError, LogSink, RequestContext, ToolInput,
+    ComponentRuntime, HostCapabilities, HostClock, HostError, LinearCall, LinearCapability,
+    LinearHttpResult, LinearTransport, LinearTransportError, LogSink, RequestContext, ToolInput,
     ToolOutput, WIT_PACKAGE, WIT_WORLD, WasmComponentRef, WasmRuntimeLimits,
 };
+
+/// Host-side mock transport for the `host-linear` integration tests. It is the
+/// sole injector of the Linear credential — the guest never supplies one — and
+/// records the calls it received so a test can assert the host-normalised
+/// request. The `token` models a credential that must stay host-side.
+#[derive(Debug)]
+struct MockLinearTransport {
+    token: String,
+    body_json: String,
+    seen: Mutex<Vec<LinearCall>>,
+}
+
+impl MockLinearTransport {
+    fn new(token: &str, body_json: &str) -> Arc<Self> {
+        Arc::new(Self {
+            token: token.to_string(),
+            body_json: body_json.to_string(),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl LinearTransport for MockLinearTransport {
+    fn execute(&self, call: LinearCall) -> Result<LinearHttpResult, LinearTransportError> {
+        // Auth is injected here, host-side; the token never crosses to guest.
+        let _auth = format!("Authorization: Bearer {}", self.token);
+        self.seen.lock().unwrap().push(call);
+        Ok(LinearHttpResult {
+            status: 200,
+            body_json: self.body_json.clone(),
+        })
+    }
+}
 
 /// Build the example plugin once and cache the resulting `.wasm` path.
 fn plugin_component() -> &'static PathBuf {
@@ -135,6 +169,7 @@ fn example_plugin_logs_and_reads_allowed_file() {
         scrubber: Scrubber::empty(),
         clock: HostClock::Fixed(1_234),
         log_sink: log_sink.clone(),
+        linear: None,
     };
 
     let out = run(
@@ -301,6 +336,106 @@ fn log_redacts_registered_secret_value_in_message() {
     assert!(
         message.contains("***REDACTED***"),
         "expected redaction marker in {message}",
+    );
+}
+
+#[test]
+fn example_plugin_runs_allowed_linear_operation_without_leaking_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let loaded = load(&rt);
+
+    let token = "lr_live_HOSTONLY_TOKEN";
+    let transport = MockLinearTransport::new(token, r#"{"data":{"viewer":{"id":"u_42"}}}"#);
+    let log_sink = LogSink::new();
+    let caps = HostCapabilities {
+        // The scrubber knows the host token so any accidental echo is redacted.
+        scrubber: Scrubber::with_secrets(vec![token.to_string()]),
+        clock: HostClock::Fixed(7),
+        log_sink: log_sink.clone(),
+        linear: Some(LinearCapability::with_default_allowlist(transport.clone())),
+        ..Default::default()
+    };
+
+    let out = run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        caps,
+        serde_json::json!({
+            "linear_operation": "Viewer",
+            "linear_query": "query Viewer { viewer { id } }",
+            "linear_variables": "{\"first\":1}",
+            "linear_mode": "read",
+        }),
+    )
+    .expect("guest run succeeds");
+
+    assert!(!out.is_error);
+    let summary: serde_json::Value = serde_json::from_str(&out.result_json).unwrap();
+    assert_eq!(summary["linear"]["status"], 200);
+    assert!(
+        summary["linear"]["body_json"]
+            .as_str()
+            .unwrap()
+            .contains("u_42"),
+        "guest should observe the GraphQL response body: {}",
+        out.result_json,
+    );
+
+    // The host transport saw the host-normalised call; the guest never
+    // supplied a header or endpoint.
+    let calls = transport.seen.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].operation_name.as_deref(), Some("Viewer"));
+    assert_eq!(calls[0].endpoint, LinearCapability::DEFAULT_ENDPOINT);
+
+    // The raw token must not appear in anything the guest can read or that is
+    // logged.
+    assert!(
+        !out.result_json.contains(token),
+        "token leaked into guest result: {}",
+        out.result_json,
+    );
+    let audit = log_sink
+        .records()
+        .into_iter()
+        .find(|r| r.op == "host-linear.linear-graphql")
+        .expect("a host-linear audit record");
+    let dump = format!("{audit:?}");
+    assert!(!dump.contains(token), "token leaked into audit log: {dump}");
+    // The audit fingerprints the query rather than logging it verbatim.
+    let fields = audit.fields_json.expect("audit carries fields");
+    assert!(fields.contains("query_fingerprint"), "fields: {fields}");
+    assert!(
+        !fields.contains("viewer { id }"),
+        "raw query text leaked into audit: {fields}",
+    );
+}
+
+#[test]
+fn example_plugin_linear_denied_when_capability_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rt = runtime();
+    let loaded = load(&rt);
+
+    // No linear capability configured: the guest call must fail closed.
+    let result = run(
+        &rt,
+        &loaded,
+        request_in(tmp.path()),
+        HostCapabilities {
+            clock: HostClock::Fixed(1),
+            ..Default::default()
+        },
+        serde_json::json!({
+            "linear_query": "query { viewer { id } }",
+        }),
+    );
+
+    assert!(
+        matches!(result, Err(HostError::Denied(_))),
+        "unconfigured linear capability should deny, got {result:?}",
     );
 }
 

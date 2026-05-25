@@ -1,10 +1,11 @@
-//! Example Wasm extension exercising the initial host capabilities (#16).
+//! Example Wasm extension exercising the host capabilities (#16, #17).
 //!
-//! This is the canonical `cadenza:runtime@0.2.0` example component. It is
-//! intentionally a *demonstration* of the four in-scope host imports —
-//! `host-log`, `host-time`, `host-workspace`, `host-secrets` — not the
-//! eventual Linear GraphQL extension (that needs `host-linear`, which is a
-//! non-goal for #16).
+//! This is the canonical `cadenza:runtime@0.2.0` example component. It
+//! demonstrates the five linked host imports — `host-log`, `host-time`,
+//! `host-workspace`, `host-secrets` (#16) and `host-linear` (#17). The Linear
+//! call exercises the host-mediated `linear-graphql` boundary: the guest
+//! supplies only an operation name, query, variables, and mode — never a
+//! credential or header — and the host injects auth on its side.
 //!
 //! `tool.run` reads a small JSON request out of `tool-input.args-json`,
 //! performs the requested capability calls, and returns a JSON summary.
@@ -22,11 +23,12 @@ mod component {
         world: "tool-runtime",
     });
 
+    use cadenza::runtime::host_linear::linear_graphql;
     use cadenza::runtime::host_log::log;
     use cadenza::runtime::host_secrets::secret_exists;
     use cadenza::runtime::host_time::now_millis;
     use cadenza::runtime::host_workspace::workspace_read;
-    use cadenza::runtime::types::{HostError, LogLevel, ToolInput, ToolOutput};
+    use cadenza::runtime::types::{GraphqlMode, HostError, LogLevel, ToolInput, ToolOutput};
     use exports::cadenza::runtime::tool::Guest;
 
     struct Component;
@@ -92,11 +94,41 @@ mod component {
                 None => None,
             };
 
+            // host-linear: run a controlled Linear GraphQL operation. The
+            // guest supplies only the operation name / query / variables /
+            // mode; the host injects auth and never discloses the credential.
+            // A host-error (e.g. denied endpoint, upstream failure) propagates
+            // unchanged.
+            let linear = match args.get("linear_query").and_then(|v| v.as_str()) {
+                Some(query) => {
+                    let operation_name = args
+                        .get("linear_operation")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let variables = args
+                        .get("linear_variables")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let mode = match args.get("linear_mode").and_then(|v| v.as_str()) {
+                        Some("write") => GraphqlMode::Write,
+                        _ => GraphqlMode::Read,
+                    };
+                    let response =
+                        linear_graphql(operation_name.as_deref(), query, variables, mode)?;
+                    Some(serde_json::json!({
+                        "status": response.status,
+                        "body_json": response.body_json,
+                    }))
+                }
+                None => None,
+            };
+
             let summary = serde_json::json!({
                 "now_millis": now,
                 "logged": logged,
                 "read": read,
                 "secret_present": secret_present,
+                "linear": linear,
             });
 
             Ok(ToolOutput {

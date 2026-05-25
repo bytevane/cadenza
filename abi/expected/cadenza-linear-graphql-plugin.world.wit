@@ -6,6 +6,7 @@ world root {
   import cadenza:runtime/host-time@0.2.0;
   import cadenza:runtime/host-workspace@0.2.0;
   import cadenza:runtime/host-secrets@0.2.0;
+  import cadenza:runtime/host-linear@0.2.0;
   import wasi:io/poll@0.2.6;
   import wasi:io/error@0.2.6;
   import wasi:io/streams@0.2.6;
@@ -50,6 +51,16 @@ package cadenza:runtime@0.2.0 {
       truncated: bool,
     }
 
+    enum graphql-mode {
+      read,
+      write,
+    }
+
+    record graphql-response {
+      status: u16,
+      body-json: string,
+    }
+
     record tool-input {
       name: string,
       args-json: string,
@@ -77,6 +88,11 @@ package cadenza:runtime@0.2.0 {
     use types.{host-error};
 
     secret-exists: func(name: string) -> result<bool, host-error>;
+  }
+  interface host-linear {
+    use types.{graphql-mode, graphql-response, host-error};
+
+    linear-graphql: func(operation-name: option<string>, query: string, variables-json: string, mode: graphql-mode) -> result<graphql-response, host-error>;
   }
   interface tool {
     use types.{host-error, tool-input, tool-output};

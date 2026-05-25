@@ -7,13 +7,14 @@
 //! `WIT_WORLD`) otherwise the loader fails closed.
 //!
 //! Host capability functions (`host-log`, `host-time`, `host-workspace`,
-//! `host-secrets`) are implemented in [`capabilities`] and linked into the
-//! Wasmtime `Linker` by [`ComponentRuntime::run_tool`]. The store carries a
-//! [`RequestContext`] (issue/plugin identity + workspace root), a
-//! [`HostCapabilities`] bundle (configured secret names, redaction scrubber,
-//! clock, captured log sink) and the `RuntimeLimiter`. The guest's incidental
-//! WASI imports are stubbed as traps (not granted) during linking, so the
-//! only live capabilities are the four host functions — see ADR 0005.
+//! `host-secrets`, `host-linear`) are implemented in [`capabilities`] and
+//! linked into the Wasmtime `Linker` by [`ComponentRuntime::run_tool`]. The
+//! store carries a [`RequestContext`] (issue/plugin identity + workspace
+//! root), a [`HostCapabilities`] bundle (configured secret names, redaction
+//! scrubber, clock, captured log sink, Linear capability) and the
+//! `RuntimeLimiter`. The guest's incidental WASI imports are stubbed as traps
+//! (not granted) during linking, so the only live capabilities are those
+//! linked host functions — see ADR 0005 and ADR 0006.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -144,6 +145,125 @@ pub struct HostCapabilities {
     pub clock: HostClock,
     /// Structured-log capture for host calls.
     pub log_sink: LogSink,
+    /// Host-mediated Linear GraphQL capability (#17, ADR 0006). `None` fails
+    /// `host-linear.linear-graphql` closed with `host-error::denied`. The raw
+    /// Linear token lives inside the transport, never here and never in guest
+    /// memory.
+    pub linear: Option<LinearCapability>,
+}
+
+/// Direction of a Linear GraphQL operation, mirroring the WIT `graphql-mode`
+/// enum without leaking the generated bindgen type into the host API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearMode {
+    Read,
+    Write,
+}
+
+impl LinearMode {
+    /// Canonical lower-case label used in the audit log (`graphql_mode`).
+    pub fn label(self) -> &'static str {
+        match self {
+            LinearMode::Read => "read",
+            LinearMode::Write => "write",
+        }
+    }
+}
+
+/// A single host-validated Linear GraphQL call handed to the transport. The
+/// transport is the *sole* injector of the `Authorization` header; nothing
+/// here is guest-supplied auth (the WIT gives the guest no header channel).
+#[derive(Debug, Clone)]
+pub struct LinearCall {
+    pub operation_name: Option<String>,
+    pub query: String,
+    /// Always valid JSON (the capability validates and normalises empty input
+    /// to `{}` before constructing the call).
+    pub variables_json: String,
+    pub mode: LinearMode,
+    /// The host-configured endpoint, already checked against the allowlist.
+    pub endpoint: String,
+}
+
+/// Raw transport result for a Linear GraphQL call. A completed HTTP exchange
+/// — including a 200 carrying a GraphQL `errors` array — is an `Ok` here;
+/// only HTTP/transport-level failures are [`LinearTransportError`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearHttpResult {
+    pub status: u16,
+    pub body_json: String,
+}
+
+/// Transport-level failure for a Linear GraphQL call. Messages are scrubbed by
+/// the capability layer before they cross into guest memory as a `host-error`.
+#[derive(Debug, thiserror::Error)]
+pub enum LinearTransportError {
+    #[error("rate limited")]
+    RateLimited(Option<u32>),
+    #[error("upstream error: {0}")]
+    Upstream(String),
+    #[error("io error: {0}")]
+    Io(String),
+}
+
+/// Host-side Linear GraphQL transport. Implementations inject the operator's
+/// credentials and perform the HTTP request; the credential is never exposed
+/// to the guest. Injectable so tests drive a mock without a live server
+/// (mirrors [`HostClock`] and `cadenza_tracker_linear::LinearTransport`).
+pub trait LinearTransport: Send + Sync + std::fmt::Debug {
+    fn execute(&self, call: LinearCall) -> Result<LinearHttpResult, LinearTransportError>;
+}
+
+/// Host-mediated Linear GraphQL capability: a host-configured endpoint, an
+/// endpoint allowlist, and the transport that injects auth. The raw token
+/// lives behind `transport`; this struct holds no credential.
+#[derive(Debug, Clone)]
+pub struct LinearCapability {
+    endpoint: String,
+    allowed_endpoints: BTreeSet<String>,
+    transport: Arc<dyn LinearTransport>,
+}
+
+impl LinearCapability {
+    /// The Linear production GraphQL endpoint — the default allowlist entry.
+    pub const DEFAULT_ENDPOINT: &'static str = "https://api.linear.app/graphql";
+
+    /// Build a capability with an explicit endpoint and allowlist.
+    pub fn new(
+        endpoint: impl Into<String>,
+        allowed_endpoints: impl IntoIterator<Item = String>,
+        transport: Arc<dyn LinearTransport>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            allowed_endpoints: allowed_endpoints.into_iter().collect(),
+            transport,
+        }
+    }
+
+    /// Build a capability targeting [`Self::DEFAULT_ENDPOINT`] with an
+    /// allowlist that contains only that endpoint.
+    pub fn with_default_allowlist(transport: Arc<dyn LinearTransport>) -> Self {
+        Self::new(
+            Self::DEFAULT_ENDPOINT,
+            [Self::DEFAULT_ENDPOINT.to_string()],
+            transport,
+        )
+    }
+
+    /// The configured endpoint host-linear will call.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Whether the configured endpoint is a member of the allowlist.
+    pub fn endpoint_allowed(&self) -> bool {
+        self.allowed_endpoints.contains(&self.endpoint)
+    }
+
+    pub(crate) fn transport(&self) -> &Arc<dyn LinearTransport> {
+        &self.transport
+    }
 }
 
 /// Clock source for `host-time.now-millis`. Defaults to the system clock;
