@@ -454,8 +454,8 @@ impl LogSink {
 
 /// Resource limiter Wasmtime consults during memory/table growth AND
 /// at instance/memory/table allocation time. Tracks configured caps
-/// plus a counter of denied growth attempts so tests can assert
-/// breach behaviour.
+/// plus two **separate, monotonic** denial-telemetry counters so
+/// operators/tests can distinguish *why* a guest was constrained.
 ///
 /// `max_tables` and `max_table_elements` are deliberately distinct: the
 /// former bounds the *count* of tables a component may allocate (consulted
@@ -464,6 +464,35 @@ impl LogSink {
 /// [`ResourceLimiter::table_growing`] at growth time). They were previously
 /// conflated, which denied a real `wasm32-wasip2` component instantiation
 /// under the production default (issue #74).
+///
+/// ## Denial telemetry contract (issue #63)
+///
+/// Wasmtime exposes resource constraints to a [`ResourceLimiter`] through
+/// two distinct mechanisms, and only some of them are observable here. The
+/// counters reflect exactly what this limiter can see, named precisely so
+/// neither is mistaken for "all resource denials":
+///
+/// - [`RuntimeLimiter::denied_growth`] — growth the *limiter itself*
+///   refused: `memory_growing` / `table_growing` saw `desired` exceed the
+///   configured size cap. This is a limiter decision; the denial surfaces to
+///   the caller as a typed `Err(ResourceLimitBreached)` (issue #75), but the
+///   counter ticks on the same path regardless of how it surfaces.
+/// - [`RuntimeLimiter::grow_failed_after_allow`] — growth the limiter
+///   *allowed* (`Ok(true)`) that Wasmtime then failed anyway: the request
+///   exceeded the wasm-declared `maximum`, or the OS could not allocate.
+///   These arrive via the `memory_grow_failed` / `table_grow_failed`
+///   callbacks, never via the limiter-denial path, so they are tracked apart
+///   from limiter decisions.
+///
+/// **Explicitly out of scope: instance/table *count*-cap denials.**
+/// `instances()` / `tables()` report the count caps, but Wasmtime enforces
+/// those during instantiation (`bump_resource_counts`) and does *not* call
+/// back into the limiter when a cap is hit — the limiter cannot observe a
+/// count-cap denial, so neither counter moves for it. Such a denial is a
+/// plain `"resource limit exceeded"` error, *not* a `wasmtime::Trap`, so it
+/// surfaces to the caller as an instantiation failure mapped to
+/// [`WasmHostError::Link`] (see `classify_instantiate`), not as a trap-derived
+/// [`WasmHostError::LimitBreached`].
 #[derive(Debug, Clone)]
 pub struct RuntimeLimiter {
     max_memory_bytes: usize,
@@ -471,6 +500,7 @@ pub struct RuntimeLimiter {
     max_table_elements: usize,
     max_instances: usize,
     denied_growth: usize,
+    grow_failed_after_allow: usize,
 }
 
 impl RuntimeLimiter {
@@ -481,11 +511,28 @@ impl RuntimeLimiter {
             max_table_elements: limits.max_table_elements,
             max_instances: limits.max_instances,
             denied_growth: 0,
+            grow_failed_after_allow: 0,
         }
     }
 
+    /// Count of growth requests the **limiter denied**: `memory_growing` or
+    /// `table_growing` saw `desired` exceed the configured size cap (the
+    /// denial surfaces to the caller as a typed `Err(ResourceLimitBreached)`,
+    /// issue #75). Does NOT include growths that failed *after* the limiter
+    /// allowed them (see [`RuntimeLimiter::grow_failed_after_allow`]) nor
+    /// instance/table count-cap denials (see the type-level contract).
     pub fn denied_growth(&self) -> usize {
         self.denied_growth
+    }
+
+    /// Count of growths the limiter **allowed** (`Ok(true)`) that Wasmtime
+    /// then failed: `desired` exceeded the wasm-declared `maximum`, or the OS
+    /// allocation failed. Counted from the `memory_grow_failed` /
+    /// `table_grow_failed` callbacks. Tracked separately from
+    /// [`RuntimeLimiter::denied_growth`] so a limiter *decision* is never
+    /// conflated with a post-approval Wasmtime *failure*.
+    pub fn grow_failed_after_allow(&self) -> usize {
+        self.grow_failed_after_allow
     }
 
     pub fn max_memory_bytes(&self) -> usize {
@@ -551,6 +598,26 @@ impl ResourceLimiter for RuntimeLimiter {
             }));
         }
         Ok(true)
+    }
+
+    /// A memory growth this limiter ALLOWED (`Ok(true)`) that Wasmtime then
+    /// failed (exceeds the wasm-declared `maximum`, or OS allocation failure).
+    /// Counted in `grow_failed_after_allow` — distinct from the typed-`Err`
+    /// limiter-denial path (issue #63 / #75). Returns `Ok(())` to preserve the
+    /// trait default's guest-visible behaviour (the `memory.grow` instruction
+    /// yields -1); we only observe, we do not change the outcome.
+    fn memory_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.grow_failed_after_allow = self.grow_failed_after_allow.saturating_add(1);
+        Ok(())
+    }
+
+    /// Table counterpart to [`RuntimeLimiter::memory_grow_failed`]: a table
+    /// growth the limiter allowed that Wasmtime then failed. Counted in
+    /// `grow_failed_after_allow`; returns `Ok(())` so guest-visible behaviour
+    /// is unchanged (issue #63).
+    fn table_grow_failed(&mut self, _error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.grow_failed_after_allow = self.grow_failed_after_allow.saturating_add(1);
+        Ok(())
     }
 
     /// Cap on the number of component instances per store. Wasmtime's
@@ -1043,6 +1110,44 @@ mod tests {
         assert!(err.downcast_ref::<ResourceLimitBreached>().is_some());
         assert_eq!(limiter.denied_growth(), 1);
     }
+
+    #[test]
+    fn post_approval_grow_failure_counts_separately_from_denied_growth() {
+        // Path 2 of issue #63: a growth the limiter ALLOWED (`Ok(true)`)
+        // that wasmtime then failed (exceeds the wasm-declared maximum, or
+        // an OS allocation failure) arrives via `memory_grow_failed` /
+        // `table_grow_failed`, NOT via the `Ok(false)` growth-callback path.
+        // These must land in `grow_failed_after_allow`, leaving the
+        // limiter-denial counter (`denied_growth`) untouched so the two
+        // semantics stay distinguishable for telemetry.
+        let mut limiter = RuntimeLimiter::new(&WasmRuntimeLimits::default());
+        assert_eq!(limiter.grow_failed_after_allow(), 0);
+
+        // Both overrides must preserve the trait default's contract: log the
+        // failure and return `Ok(())` so the guest-visible behaviour (the
+        // `*.grow` instruction returns -1) is unchanged — we only count.
+        limiter
+            .memory_grow_failed(wasmtime::Error::msg("simulated OOM after allow"))
+            .unwrap();
+        limiter
+            .table_grow_failed(wasmtime::Error::msg("simulated table maximum exceeded"))
+            .unwrap();
+
+        assert_eq!(limiter.grow_failed_after_allow(), 2);
+        // The post-approval failures must NOT inflate the limiter-denial
+        // counter — that counter means "the limiter said no", not "wasmtime
+        // failed after the limiter said yes".
+        assert_eq!(limiter.denied_growth(), 0);
+    }
+
+    // Path 3 of issue #63 (instance/table COUNT-cap denials are out of scope
+    // for the limiter's counters) is covered end-to-end by
+    // `count_cap_denial_surfaces_as_link_and_leaves_counters_untouched` in
+    // tests/host_capabilities.rs, which trips the real instance-count cap and
+    // asserts both the surfaced error variant and that neither counter moved.
+    // It cannot be a unit test here: the limiter is never called back for a
+    // count-cap denial, so the path only exists when a real component is
+    // instantiated.
 
     #[test]
     fn request_context_has_no_raw_secret_field() {

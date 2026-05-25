@@ -559,3 +559,53 @@ fn instantiation_resource_limit_breach_surfaces_as_limit_breached() {
         "issue #75 case 1: over-cap instantiation must classify as LimitBreached, got {err:?}",
     );
 }
+
+/// Issue #63, path 3: instance/table COUNT-cap denials are deliberately
+/// excluded from the limiter's denial telemetry. Wasmtime enforces the
+/// instance-count cap during instantiation (`bump_resource_counts`) and never
+/// calls back into the `RuntimeLimiter`, so the limiter cannot observe the
+/// denial. This drives a real component against a count cap of 1 (a genuine
+/// wasip2 component instantiates at least 2 instances) and asserts both that
+/// the denial surfaces as `WasmHostError::Link` (a non-trap "resource limit
+/// exceeded" error, NOT a trap-derived `LimitBreached`) and that neither
+/// growth counter moved — codifying the documented contract on
+/// `RuntimeLimiter`.
+#[test]
+fn count_cap_denial_surfaces_as_link_and_leaves_counters_untouched() {
+    let limits = WasmRuntimeLimits {
+        // Roomy table *count* cap so it does not trip before the instance
+        // count cap. Per-table element growth is governed by the separate
+        // `max_table_elements` (default, roomy) since #74, so the count caps
+        // are isolated here; the point is the instance COUNT cap.
+        max_tables: 10_000,
+        max_instances: 1,
+        ..Default::default()
+    };
+    let rt = ComponentRuntime::new(limits).expect("engine init");
+    let loaded = load(&rt);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = rt.new_store_with(request_in(tmp.path()), HostCapabilities::default());
+    let input = ToolInput {
+        name: "demo".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let outcome = rt.run_tool(&mut store, &loaded, input);
+
+    // The count-cap denial is a plain "resource limit exceeded" error, not a
+    // `wasmtime::Trap`, so `classify_instantiate` maps it to `Link`.
+    match outcome {
+        Err(WasmHostError::Link(msg)) => {
+            assert!(
+                msg.contains("resource limit exceeded") && msg.contains("instance count"),
+                "unexpected Link message: {msg}",
+            );
+        }
+        other => panic!("expected WasmHostError::Link for instance-count cap, got {other:?}"),
+    }
+
+    // The limiter was never consulted for the count-cap denial, so neither
+    // telemetry counter must have moved.
+    assert_eq!(store.data().limiter.denied_growth(), 0);
+    assert_eq!(store.data().limiter.grow_failed_after_allow(), 0);
+}
