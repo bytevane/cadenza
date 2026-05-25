@@ -32,7 +32,10 @@ echo "=== issue #$issue ==="
 gh issue view "$issue" --repo "$REPO" --json number,title,labels,body \
 	--jq '"#\(.number) \(.title)\nlabels: \(.labels | map(.name) | join(", "))\n\n\(.body)"'
 
-# 2. Current main HEAD. A failed fetch aborts here (no pipe masks its status).
-echo "=== main HEAD ==="
-git fetch origin main
-git --no-pager log --oneline origin/main -1
+# 2. Current canonical main HEAD. Fetch by repo slug, not the `origin` remote
+# (which may be a personal fork), so the baseline always matches the target
+# repo. A failed fetch aborts here (no pipe masks its status); FETCH_HEAD holds
+# the just-fetched canonical main.
+echo "=== main HEAD ($REPO) ==="
+git fetch "https://github.com/$REPO" main
+git --no-pager log --oneline FETCH_HEAD -1

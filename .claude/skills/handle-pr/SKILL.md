@@ -9,11 +9,11 @@ allowed-tools: Bash(git *) Bash(ls *) Bash(grep *) Bash(find *) Bash(cargo *) Ba
 
 cadenza 是 **contract-first** 的 Rust + WebAssembly 编排运行时,冻结契约是硬要求。处理 PR #$ARGUMENTS(bytevane/cadenza)按以下流程做契约对齐审查轮。
 
-## 当前 main HEAD
+## 当前 canonical main HEAD
 
-!`git fetch origin main 2>&1 | tail -1 && git log --oneline origin/main -1`
+!`git fetch https://github.com/bytevane/cadenza main && git --no-pager log --oneline FETCH_HEAD -1`
 
-读 PR head SHA 与 `git diff origin/main...HEAD`。契约的权威是仓库内冻结的快照(`abi/expected/`、`schemas/codex/`、`tools/versions.toml`)与 `CLAUDE.md` / `CONTRACTS.md` / `SECURITY.md`。
+按 repo slug fetch canonical main(不依赖 `origin`,它可能是个人 fork),且用 `&&` 不让管道掩盖 fetch 失败——fetch 失败即中止,不在 stale ref 上继续。`FETCH_HEAD` 即刚 fetch 的 canonical main。读 PR head SHA 与 `git diff FETCH_HEAD...HEAD`(对 canonical main 出 diff,而非可能是 fork 的 `origin/main`)。契约的权威是仓库内冻结的快照(`abi/expected/`、`schemas/codex/`、`tools/versions.toml`)与 `CLAUDE.md` / `CONTRACTS.md` / `SECURITY.md`。
 
 ## 必做的几件不常规的事
 

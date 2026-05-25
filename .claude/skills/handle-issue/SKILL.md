@@ -20,7 +20,7 @@ cadenza 是 **contract-first** 的 Rust + WebAssembly 编排运行时。冻结�
 
 !`bash .claude/skills/handle-issue/scripts/bootstrap.sh "$ARGUMENTS" 2>&1`
 
-`scripts/bootstrap.sh`(`set -euo pipefail`,fail-fast)依次做:校验参数为数字 issue 号(坏参数 exit 2,与后续 fetch 失败区分)→ 打印 issue **全文**(pin `--repo bytevane/cadenza`,不截断)→ `git fetch origin main` 后打印 main HEAD(fetch 失败即中止,无管道掩盖状态)。cadenza 不是端口,没有上游 SPEC 镜像;契约的权威是仓库内冻结的快照(`abi/expected/`、`schemas/codex/`、`tools/versions.toml`)。
+`scripts/bootstrap.sh`(`set -euo pipefail`,fail-fast)依次做:校验参数为数字 issue 号(坏参数 exit 2,与后续 fetch 失败区分)→ 打印 issue **全文**(pin `--repo bytevane/cadenza`,不截断)→ 按 repo slug `git fetch https://github.com/bytevane/cadenza main`(不依赖可能是 fork 的 `origin`)后打印 canonical main HEAD(fetch 失败即中止,无管道掩盖状态)。cadenza 不是端口,没有上游 SPEC 镜像;契约的权威是仓库内冻结的快照(`abi/expected/`、`schemas/codex/`、`tools/versions.toml`)。
 
 开工前完整读 issue 正文,尤其逐条 Acceptance criteria。
 
@@ -58,7 +58,7 @@ cadenza 是 **contract-first** 的 Rust + WebAssembly 编排运行时。冻结�
 
 ### 6. 开 PR + 审查环(关键)
 1. 开 **一个** PR 对应该 issue,body `Closes #N` 并**完整填写强制 PR 模板**(`.github/pull_request_template.md`:触及哪些契约、测试清单、AI 辅助声明)。治理/文档/契约类改动**单开 PR**,不要塞进 fix PR。
-2. **默认每次 push 都派两个独立盲审**——不是每个 PR 一次,是每个 commit。同时派 Claude `general-purpose` subagent + Codex(`codex:codex-rescue`)审 `git diff origin/main...HEAD`,**不透露你的结论**,要求 severity 标注 + 末尾 `MERGE-READY / NEEDS-CHANGES / BLOCKED` 判决。两者抓不同缺陷类。(注:codex-rescue 沙箱可能被网络限制;受限时以本地审查为主。)
+2. **默认每次 push 都派两个独立盲审**——不是每个 PR 一次,是每个 commit。同时派 Claude `general-purpose` subagent + Codex(`codex:codex-rescue`)审 `git diff FETCH_HEAD...HEAD`(对 bootstrap 按 repo slug fetch 的 canonical main 出 diff,而非可能是 fork 的 `origin/main`),**不透露你的结论**,要求 severity 标注 + 末尾 `MERGE-READY / NEEDS-CHANGES / BLOCKED` 判决。两者抓不同缺陷类。(注:codex-rescue 沙箱可能被网络限制;受限时以本地审查为主。)
 3. **若仓库配了 `@codex` GitHub bot**:每次 push 另跑 `gh pr comment <pr> --body "@codex review"`,记下该 trigger comment 的 id → **轮询**它自带的 reactions 计数摘要:`gh api repos/bytevane/cadenza/issues/comments/<id> --jq '.reactions.eyes'`。Codex review 不是 check run、reactions 没有 watch API,只能轮询;**CI 绿**则用原生 `gh pr checks <pr> --watch --fail-fast`,别 sleep 轮询。**只 `eyes==0` 不算完成**(可能还没开始 👀):必须等到先出现 👀、再消失,**且**有正向完成信号(Codex 在该 head 贴了 review/comment,或 trigger comment 拿到 👍),然后查 `reviewThreads` 有无新的未解决 actionable thread。
 4. 每条 finding 归入 ≥1 类(**契约漂移 / 跨 crate 一致性 / Rust 正确性 / 安慰剂测试**),然后修掉或**开 follow-up issue 延后**(body 含相关契约/文件引用 + acceptance criteria,并从 PR 链接)。
 5. **审查深度匹配 blast radius**:触及契约、secret、workspace 安全、orchestrator 状态的破坏性路径要穷尽对抗式审查;纯增量改动一轮即可。
