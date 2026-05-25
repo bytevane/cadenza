@@ -915,18 +915,26 @@ mod tests {
 
     #[test]
     fn linear_empty_query_is_invalid_argument() {
-        let cap = LinearCapability::with_default_allowlist(MockTransport::ok("{}"));
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
         let mut store = linear_store(Some(cap), Scrubber::empty());
         let err = store
             .data_mut()
             .linear_graphql(None, "   ".to_string(), String::new(), GraphqlMode::Read)
             .expect_err("empty query must be rejected");
         assert!(matches!(err, HostError::InvalidArgument(_)), "got {err:?}");
+        // Validation happens before any request — a malformed call must never
+        // reach the upstream.
+        assert!(
+            transport.calls().is_empty(),
+            "rejected call hit the transport"
+        );
     }
 
     #[test]
     fn linear_invalid_variables_json_is_invalid_argument() {
-        let cap = LinearCapability::with_default_allowlist(MockTransport::ok("{}"));
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
         let mut store = linear_store(Some(cap), Scrubber::empty());
         let err = store
             .data_mut()
@@ -938,6 +946,10 @@ mod tests {
             )
             .expect_err("malformed variables must be rejected");
         assert!(matches!(err, HostError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            transport.calls().is_empty(),
+            "rejected call hit the transport"
+        );
     }
 
     #[test]
