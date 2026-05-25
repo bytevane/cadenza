@@ -25,14 +25,17 @@
 //! - Host errors never echo absolute host paths back to the guest.
 
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use camino::Utf8Path;
 use wasmtime::Store;
 use wasmtime::component::{HasSelf, Linker, types::ComponentItem};
 
 use crate::{
-    ComponentRuntime, DeferredCapability, HostLogRecord, LinearCall, LinearMode,
-    LinearTransportError, LoadedComponent, StoreState, WasmHostError,
+    ComponentRuntime, DeferredCapability, HostLogRecord, LinearCall, LinearHttpResult, LinearMode,
+    LinearTransport, LinearTransportError, LoadedComponent, StoreState, WasmHostError,
 };
 
 wasmtime::component::bindgen!({
@@ -359,6 +362,47 @@ impl cadenza::runtime::host_linear::Host for StoreState {
 /// failure from bloating the bounded log sink host-side.
 const MAX_AUDIT_ERROR_BYTES: usize = 512;
 
+/// Process-wide ceiling on concurrent in-flight `host-linear` transport
+/// workers. Each `linear-graphql` call runs its transport on a detached thread
+/// (ADR 0007); a hung transport leaves that worker running after the host has
+/// already returned `timeout`. Without a ceiling, a guest hitting a hung
+/// upstream repeatedly — or many guests at once — could accumulate stuck
+/// worker threads until thread creation or memory is exhausted: a host-level
+/// denial of service (PR #83 review P1). Past this ceiling a call fails closed
+/// with `rate-limited` instead of spawning another worker. It is process-wide
+/// (a `static`) because the threads it bounds are a process resource shared by
+/// every runtime/store in the host.
+const MAX_INFLIGHT_LINEAR_WORKERS: usize = 64;
+static INFLIGHT_LINEAR_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Reserve one in-flight worker slot under `cap`. On success increments the
+/// counter and returns `true`; on saturation it leaves the counter unchanged
+/// and returns `false`. Concurrent callers each observe a distinct prior value
+/// from `fetch_add`, so at most `cap` of them see `prior < cap` and reserve —
+/// the number of *actually spawned* workers therefore never exceeds `cap`.
+/// A free function so the ceiling is unit-testable without spawning real
+/// worker threads.
+fn try_reserve_worker_slot(counter: &AtomicUsize, cap: usize) -> bool {
+    if counter.fetch_add(1, Ordering::AcqRel) >= cap {
+        counter.fetch_sub(1, Ordering::AcqRel);
+        false
+    } else {
+        true
+    }
+}
+
+/// RAII release of one reserved in-flight worker slot. Held by the detached
+/// transport worker so the slot is freed when the worker actually finishes —
+/// not when the host returns `timeout` — and is freed on a transport panic too
+/// (via `Drop` during unwind).
+struct WorkerSlot;
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        INFLIGHT_LINEAR_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A `linear-graphql` failure split into what the guest may see (`guest`: a
 /// typed variant with a *generic* message, never carrying upstream text or a
 /// token) and what is retained host-side for the audit (`audit_detail`:
@@ -383,6 +427,19 @@ impl LinearFailure {
         Self {
             audit_detail: format!("invalid-argument: {message}"),
             guest: HostError::InvalidArgument(message),
+        }
+    }
+
+    /// A host-enforced transport-deadline breach (ADR 0007). The guest sees the
+    /// payload-free `host-error::timeout`; the audit records a generic detail
+    /// (the deadline, never any transport internals).
+    fn timeout(deadline: Duration) -> Self {
+        Self {
+            guest: HostError::Timeout,
+            audit_detail: format!(
+                "timeout: transport exceeded {} ms deadline",
+                deadline.as_millis()
+            ),
         }
     }
 }
@@ -440,28 +497,99 @@ impl StoreState {
             // Hand the limit to the transport so it can bound its own read and
             // never materialise an oversized body host-side.
             max_response_bytes: self.http_body_limit,
+            // Hand the same deadline the host watchdog enforces to the
+            // transport, so a real client can set its own timeout from it.
+            timeout: self.linear_transport_timeout,
         };
-        match cap.transport().execute(call) {
-            Ok(res) => {
-                // Backstop: even if the transport over-read, refuse to hand a
-                // body larger than `max_http_body_bytes` across to guest
-                // memory. Bounding the host-side allocation itself is the
-                // transport's responsibility (see `LinearCall::max_response_bytes`).
-                if res.body_json.len() > self.http_body_limit {
-                    return Err(LinearFailure {
-                        guest: HostError::Upstream("linear response body too large".to_string()),
-                        audit_detail: format!(
-                            "response body exceeds limit of {} bytes",
-                            self.http_body_limit
-                        ),
-                    });
-                }
-                Ok(GraphqlResponse {
-                    status: res.status,
-                    body_json: res.body_json,
-                })
-            }
-            Err(err) => Err(self.map_transport_failure(err)),
+        // Run the transport under a host-enforced wall-clock bound: a slow or
+        // hung transport must not pin the host thread (ADR 0007). Epoch
+        // interruption cannot help here — it preempts guest code, and the guest
+        // is not executing while this host call blocks.
+        let res = self.execute_within_deadline(cap.transport(), call)?;
+        // Backstop: even if the transport over-read, refuse to hand a body
+        // larger than `max_http_body_bytes` across to guest memory. Bounding
+        // the host-side allocation itself is the transport's responsibility
+        // (see `LinearCall::max_response_bytes`).
+        if res.body_json.len() > self.http_body_limit {
+            return Err(LinearFailure {
+                guest: HostError::Upstream("linear response body too large".to_string()),
+                audit_detail: format!(
+                    "response body exceeds limit of {} bytes",
+                    self.http_body_limit
+                ),
+            });
+        }
+        Ok(GraphqlResponse {
+            status: res.status,
+            body_json: res.body_json,
+        })
+    }
+
+    /// Run `transport.execute(call)` under a host-enforced wall-clock deadline
+    /// (ADR 0007). The transport runs on a detached worker thread; this waits
+    /// on a bounded `recv_timeout`. If the deadline elapses first the call
+    /// fails with `host-error::timeout` and the host thread is freed — the
+    /// worker is left to finish on its own rather than blocking the host (it is
+    /// reclaimed by the transport's own client timeout once a real transport
+    /// lands). The bound does **not** depend on the transport cooperating: a
+    /// transport that ignores every deadline still cannot pin the host thread
+    /// past `linear_transport_timeout`.
+    ///
+    /// Concurrent in-flight workers are capped process-wide
+    /// ([`MAX_INFLIGHT_LINEAR_WORKERS`]) so repeated timeouts under a hung
+    /// transport cannot accumulate unbounded threads; past the cap a call
+    /// fails closed with `rate-limited` rather than spawning another worker
+    /// (PR #83 review P1).
+    fn execute_within_deadline(
+        &self,
+        transport: &Arc<dyn LinearTransport>,
+        call: LinearCall,
+    ) -> Result<LinearHttpResult, LinearFailure> {
+        use std::sync::mpsc::{self, RecvTimeoutError};
+
+        let deadline = self.linear_transport_timeout;
+        // Fail closed past the process-wide worker ceiling so a hung transport
+        // plus repeated calls cannot accumulate stuck threads (PR #83 P1). The
+        // reserved slot is released by the worker's `WorkerSlot` guard when it
+        // finishes — or below if the spawn itself fails.
+        if !try_reserve_worker_slot(&INFLIGHT_LINEAR_WORKERS, MAX_INFLIGHT_LINEAR_WORKERS) {
+            return Err(LinearFailure {
+                guest: HostError::RateLimited(None),
+                audit_detail: format!(
+                    "rate-limited: {MAX_INFLIGHT_LINEAR_WORKERS} linear transport workers already in flight"
+                ),
+            });
+        }
+        let transport = Arc::clone(transport);
+        let (tx, rx) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("cadenza-host-linear-transport".to_string())
+            .spawn(move || {
+                // Release the reserved slot when the worker finishes — even if
+                // the host already returned `timeout`, and even on a panic.
+                let _slot = WorkerSlot;
+                // If the host already timed out, the receiver is dropped and
+                // this send is a no-op — the detached worker simply ends.
+                let _ = tx.send(transport.execute(call));
+            });
+        if let Err(e) = spawned {
+            // The worker (and its slot guard) never started; release the slot
+            // we reserved so a spawn failure does not leak the count.
+            INFLIGHT_LINEAR_WORKERS.fetch_sub(1, Ordering::AcqRel);
+            return Err(LinearFailure {
+                guest: HostError::Io("linear transport io error".to_string()),
+                audit_detail: format!("io: failed to spawn transport worker: {e}"),
+            });
+        }
+        match rx.recv_timeout(deadline) {
+            Ok(Ok(res)) => Ok(res),
+            Ok(Err(err)) => Err(self.map_transport_failure(err)),
+            Err(RecvTimeoutError::Timeout) => Err(LinearFailure::timeout(deadline)),
+            // The worker dropped its sender without sending — it panicked.
+            Err(RecvTimeoutError::Disconnected) => Err(LinearFailure {
+                guest: HostError::Io("linear transport io error".to_string()),
+                audit_detail: "io: transport worker terminated before returning".to_string(),
+            }),
         }
     }
 
@@ -1052,6 +1180,7 @@ mod tests {
         WasmRuntimeLimits,
     };
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// Mock transport that is the *host-side* injector of auth. It records the
     /// calls it received (so a test can assert the guest never influenced
@@ -1459,5 +1588,159 @@ mod tests {
         assert_eq!(cadenza_obs::fields::FIELD_DURATION_MS, "duration_ms");
         assert_eq!(cadenza_obs::fields::FIELD_GRAPHQL_MODE, "graphql_mode");
         assert_eq!(cadenza_obs::fields::FIELD_ERROR, "error");
+    }
+
+    // --- host-linear transport timeout (#77, ADR 0007) ---
+
+    /// Transport that sleeps past any test deadline and *then* returns `Ok`,
+    /// so a test can prove the host watchdog stops waiting at the deadline
+    /// rather than blocking on the transport. Returning `Ok` (not `Err`) after
+    /// the sleep makes a regression that drops the watchdog deterministic: the
+    /// call would block for `delay` and surface success, failing the
+    /// `HostError::Timeout` assertion instead of hanging the test.
+    #[derive(Debug)]
+    struct SleepingTransport {
+        delay: Duration,
+    }
+
+    impl SleepingTransport {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self { delay })
+        }
+    }
+
+    impl LinearTransport for SleepingTransport {
+        fn execute(&self, _call: LinearCall) -> Result<LinearHttpResult, LinearTransportError> {
+            std::thread::sleep(self.delay);
+            Ok(LinearHttpResult {
+                status: 200,
+                body_json: "{}".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn linear_transport_exceeding_deadline_surfaces_timeout_without_blocking() {
+        // A transport that does not return within the configured deadline must
+        // surface `host-error::timeout` and free the host thread, not block it
+        // for the transport's full duration (ADR 0007).
+        let limits = WasmRuntimeLimits {
+            linear_transport_timeout_ms: 50,
+            ..Default::default()
+        };
+        // Sleeps far past the 50 ms deadline before it would return Ok.
+        let transport = SleepingTransport::new(Duration::from_secs(2));
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let mut store = linear_store_with(limits, Some(cap), Scrubber::empty());
+
+        let started = std::time::Instant::now();
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("transport exceeding the deadline must surface a timeout");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(err, HostError::Timeout), "got {err:?}");
+        // The host returned at ~the 50 ms deadline, well before the transport's
+        // 2 s sleep — proving it did not block on the transport. The 1 s upper
+        // bound is a generous, race-free barrier (deadline + spawn/recv
+        // overhead is far below it) that still separates "bounded" from
+        // "blocked".
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "host blocked on the transport instead of bounding it: {elapsed:?}",
+        );
+        // A timeout is audited like every other outcome, with a generic detail.
+        let audit = last_audit(&store);
+        let fields: serde_json::Value =
+            serde_json::from_str(audit.fields_json.as_deref().unwrap()).unwrap();
+        assert!(
+            fields[cadenza_obs::fields::FIELD_ERROR]
+                .as_str()
+                .unwrap()
+                .contains("timeout"),
+            "timeout must be recorded in the audit error detail",
+        );
+    }
+
+    /// Transport that panics instead of returning, to drive the watchdog's
+    /// `Disconnected` arm: the worker drops its sender without sending.
+    #[derive(Debug)]
+    struct PanickingTransport;
+
+    impl LinearTransport for PanickingTransport {
+        fn execute(&self, _call: LinearCall) -> Result<LinearHttpResult, LinearTransportError> {
+            panic!("transport boom");
+        }
+    }
+
+    #[test]
+    fn linear_transport_panic_surfaces_io_without_hanging() {
+        // A panicking transport drops its sender without ever sending; the
+        // watchdog must surface a typed `io` error (the `Disconnected` arm),
+        // never block waiting for a result that will never arrive.
+        let transport = Arc::new(PanickingTransport);
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("a panicking transport must surface a typed error");
+        assert!(matches!(err, HostError::Io(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn linear_call_carries_the_configured_transport_deadline() {
+        // Defence-in-depth (ADR 0007 §3): the host hands the configured
+        // deadline to the transport via `LinearCall::timeout` so the future
+        // real client can set its own timeout from the same source the
+        // watchdog enforces.
+        let limits = WasmRuntimeLimits {
+            linear_transport_timeout_ms: 1234,
+            ..Default::default()
+        };
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
+        let mut store = linear_store_with(limits, Some(cap), Scrubber::empty());
+        store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect("succeeds");
+        assert_eq!(transport.calls()[0].timeout, Duration::from_millis(1234));
+    }
+
+    #[test]
+    fn worker_slot_reservation_saturates_at_cap_and_releases() {
+        // PR #83 P1: the in-flight worker ceiling must admit exactly `cap`
+        // reservations, refuse further ones *without* mutating the counter, and
+        // admit again once a slot is released — so a hung transport cannot
+        // accumulate unbounded workers. Driven on a local counter so it is
+        // deterministic and independent of the process-wide static.
+        let counter = AtomicUsize::new(0);
+        assert!(try_reserve_worker_slot(&counter, 2)); // 0 -> 1
+        assert!(try_reserve_worker_slot(&counter, 2)); // 1 -> 2
+        // Saturated: refused, and the counter must not have crept past the cap.
+        assert!(!try_reserve_worker_slot(&counter, 2));
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+        // Release one (as the worker's `WorkerSlot` guard would) — a new
+        // reservation then succeeds again.
+        counter.fetch_sub(1, Ordering::AcqRel);
+        assert!(try_reserve_worker_slot(&counter, 2)); // 1 -> 2
+        assert_eq!(counter.load(Ordering::Acquire), 2);
     }
 }
