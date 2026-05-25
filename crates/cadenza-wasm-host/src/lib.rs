@@ -182,12 +182,33 @@ pub struct HostLogRecord {
     pub fields_json: Option<String>,
 }
 
-/// Cloneable, shareable capture of [`HostLogRecord`]s. Cheap to clone (the
-/// buffer is behind an `Arc<Mutex<…>>`), so a caller can hold a handle and
-/// inspect what the guest logged after `run_tool` returns.
-#[derive(Debug, Clone, Default)]
+/// Default cap on captured [`HostLogRecord`]s. A guest can call host imports
+/// in a tight loop (e.g. `now-millis`) before its epoch deadline; without a
+/// cap the sink would grow unbounded host-side, bypassing guest memory limits
+/// and threatening host availability. Once the cap is hit, further records are
+/// counted in [`LogSink::dropped`] instead of stored.
+pub const DEFAULT_LOG_CAPACITY: usize = 4096;
+
+/// Cloneable, shareable, **bounded** capture of [`HostLogRecord`]s. Cheap to
+/// clone (the buffer is behind an `Arc<Mutex<…>>`), so a caller can hold a
+/// handle and inspect what the guest logged after `run_tool` returns. Bounded
+/// to `capacity` records to keep a chatty guest from exhausting host memory.
+#[derive(Debug, Clone)]
 pub struct LogSink {
-    inner: Arc<Mutex<Vec<HostLogRecord>>>,
+    inner: Arc<Mutex<LogSinkInner>>,
+}
+
+#[derive(Debug)]
+struct LogSinkInner {
+    records: Vec<HostLogRecord>,
+    dropped: u64,
+    capacity: usize,
+}
+
+impl Default for LogSink {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_LOG_CAPACITY)
+    }
 }
 
 impl LogSink {
@@ -195,16 +216,39 @@ impl LogSink {
         Self::default()
     }
 
-    /// Snapshot of the records captured so far.
-    pub fn records(&self) -> Vec<HostLogRecord> {
-        self.inner.lock().expect("log sink mutex poisoned").clone()
+    /// Sink that retains at most `capacity` records; further pushes are
+    /// counted in [`LogSink::dropped`].
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LogSinkInner {
+                records: Vec::new(),
+                dropped: 0,
+                capacity,
+            })),
+        }
     }
 
-    pub(crate) fn push(&self, record: HostLogRecord) {
+    /// Snapshot of the records captured so far (up to `capacity`).
+    pub fn records(&self) -> Vec<HostLogRecord> {
         self.inner
             .lock()
             .expect("log sink mutex poisoned")
-            .push(record);
+            .records
+            .clone()
+    }
+
+    /// Count of records dropped after the capacity was reached.
+    pub fn dropped(&self) -> u64 {
+        self.inner.lock().expect("log sink mutex poisoned").dropped
+    }
+
+    pub(crate) fn push(&self, record: HostLogRecord) {
+        let mut inner = self.inner.lock().expect("log sink mutex poisoned");
+        if inner.records.len() >= inner.capacity {
+            inner.dropped = inner.dropped.saturating_add(1);
+            return;
+        }
+        inner.records.push(record);
     }
 }
 
@@ -614,5 +658,24 @@ mod tests {
         // absent and the orchestrator passes credentials via host
         // functions that never copy raw values into guest memory.
         let _ = RequestContext::default();
+    }
+
+    #[test]
+    fn log_sink_is_bounded_and_counts_drops() {
+        // A chatty guest must not grow the sink without bound; past the
+        // capacity, records are dropped and counted instead of stored.
+        let sink = LogSink::with_capacity(2);
+        for _ in 0..5 {
+            sink.push(HostLogRecord {
+                op: "host-time.now-millis".to_string(),
+                issue_id: None,
+                plugin_name: None,
+                level: None,
+                message: None,
+                fields_json: None,
+            });
+        }
+        assert_eq!(sink.records().len(), 2);
+        assert_eq!(sink.dropped(), 3);
     }
 }

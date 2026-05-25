@@ -19,6 +19,8 @@
 //!   and a `tracing` event keyed by the `cadenza-obs` field-name constants.
 //! - Host errors never echo absolute host paths back to the guest.
 
+use std::io::{Read, Seek, SeekFrom};
+
 use camino::Utf8Path;
 use wasmtime::Store;
 use wasmtime::component::{HasSelf, Linker};
@@ -78,7 +80,7 @@ impl ComponentRuntime {
         add_host_capabilities(&mut linker)?;
         linker.allow_shadowing(false);
         let bindings = ToolRuntime::instantiate(&mut *store, &loaded.component, &linker)
-            .map_err(|e| WasmHostError::Link(format!("instantiate: {e}")))?;
+            .map_err(classify_instantiate)?;
         let result = bindings
             .cadenza_runtime_tool()
             .call_run(&mut *store, &input)
@@ -218,8 +220,20 @@ fn read_workspace(
         .as_std_path()
         .canonicalize()
         .map_err(map_io_error)?;
-    let all = std::fs::read(&resolved).map_err(map_io_error)?;
-    let (bytes, truncated) = slice_bytes(&all, offset, limit);
+    // 4. Read only the requested window (seek + bounded read), never the whole
+    //    file: a guest asking for a tiny slice of a huge in-root file must not
+    //    force the host to allocate the entire file. An unbounded request
+    //    (`limit == None`) is hard-capped at `MAX_WORKSPACE_READ_BYTES`.
+    let mut file = std::fs::File::open(&resolved).map_err(map_io_error)?;
+    let total_len = file.metadata().map_err(map_io_error)?.len();
+    let (bytes, truncated) = read_window(
+        &mut file,
+        total_len,
+        offset,
+        limit,
+        MAX_WORKSPACE_READ_BYTES,
+    )
+    .map_err(map_io_error)?;
 
     if as_text && std::str::from_utf8(&bytes).is_err() {
         return Err(HostError::InvalidArgument(
@@ -234,19 +248,43 @@ fn read_workspace(
     })
 }
 
-/// Apply the `offset`/`limit` window to `all`. `truncated` is true when bytes
-/// remain past the returned window. An `offset` beyond EOF yields an empty,
-/// non-truncated read rather than an error.
-fn slice_bytes(all: &[u8], offset: Option<u64>, limit: Option<u64>) -> (Vec<u8>, bool) {
-    let total = all.len() as u64;
-    let start = offset.unwrap_or(0).min(total) as usize;
-    let avail = &all[start..];
-    match limit {
-        Some(lim) => {
-            let take = (lim.min(avail.len() as u64)) as usize;
-            (avail[..take].to_vec(), (avail.len() as u64) > lim)
-        }
-        None => (avail.to_vec(), false),
+/// Hard cap on a single `workspace-read` when the guest gives no explicit
+/// `limit`, so an unbounded request cannot force the host to allocate an
+/// arbitrarily large file. A guest wanting more must page with `offset`.
+const MAX_WORKSPACE_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read the `offset`/`limit` window from `src` (a seekable reader of known
+/// `total_len`) without loading the whole file. The window size is
+/// `limit`, hard-capped at `cap`; `truncated` is true when bytes remain past
+/// the returned window. An `offset` beyond EOF yields an empty, non-truncated
+/// read rather than an error.
+fn read_window<R: Read + Seek>(
+    src: &mut R,
+    total_len: u64,
+    offset: Option<u64>,
+    limit: Option<u64>,
+    cap: u64,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let start = offset.unwrap_or(0).min(total_len);
+    src.seek(SeekFrom::Start(start))?;
+    let window = limit.unwrap_or(cap).min(cap);
+    let mut buf = Vec::new();
+    src.take(window).read_to_end(&mut buf)?;
+    let remaining = total_len - start;
+    let truncated = remaining > buf.len() as u64;
+    Ok((buf, truncated))
+}
+
+/// Map a `ToolRuntime::instantiate` failure onto a typed host error.
+/// Instantiation can fail either because the linker is missing wiring (a
+/// `Link` problem) or because guest initialization code traps / breaches a
+/// resource limit; the latter must surface as `Timeout`/`LimitBreached` so
+/// callers can branch on the cause.
+fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
+    if err.downcast_ref::<wasmtime::Trap>().is_some() {
+        crate::classify_trap(err)
+    } else {
+        WasmHostError::Link(format!("instantiate: {err}"))
     }
 }
 
@@ -329,48 +367,78 @@ mod tests {
     use cadenza_obs::Scrubber;
     use std::io::{Error, ErrorKind};
 
+    /// Drive `read_window` over an in-memory `Cursor` (a `Read + Seek`).
+    fn win(data: &[u8], offset: Option<u64>, limit: Option<u64>, cap: u64) -> (Vec<u8>, bool) {
+        read_window(
+            &mut std::io::Cursor::new(data.to_vec()),
+            data.len() as u64,
+            offset,
+            limit,
+            cap,
+        )
+        .unwrap()
+    }
+
+    const BIG_CAP: u64 = u64::MAX;
+
     #[test]
-    fn slice_bytes_no_window_returns_all() {
-        let (bytes, truncated) = slice_bytes(b"hello", None, None);
+    fn read_window_no_limit_returns_all_within_cap() {
+        let (bytes, truncated) = win(b"hello", None, None, BIG_CAP);
         assert_eq!(bytes, b"hello");
         assert!(!truncated);
     }
 
     #[test]
-    fn slice_bytes_limit_below_length_truncates() {
-        let (bytes, truncated) = slice_bytes(b"hello", None, Some(3));
+    fn read_window_limit_below_length_truncates() {
+        let (bytes, truncated) = win(b"hello", None, Some(3), BIG_CAP);
         assert_eq!(bytes, b"hel");
         assert!(truncated);
     }
 
     #[test]
-    fn slice_bytes_limit_equal_length_is_not_truncated() {
+    fn read_window_limit_equal_length_is_not_truncated() {
         // Paired-edge with the case above: limit == len is the boundary where
         // truncation flips off.
-        let (bytes, truncated) = slice_bytes(b"hello", None, Some(5));
+        let (bytes, truncated) = win(b"hello", None, Some(5), BIG_CAP);
         assert_eq!(bytes, b"hello");
         assert!(!truncated);
     }
 
     #[test]
-    fn slice_bytes_offset_then_limit() {
-        let (bytes, truncated) = slice_bytes(b"hello world", Some(6), Some(3));
+    fn read_window_offset_then_limit() {
+        let (bytes, truncated) = win(b"hello world", Some(6), Some(3), BIG_CAP);
         assert_eq!(bytes, b"wor");
         assert!(truncated);
     }
 
     #[test]
-    fn slice_bytes_offset_at_eof_is_empty_not_truncated() {
-        let (bytes, truncated) = slice_bytes(b"hello", Some(5), None);
+    fn read_window_offset_at_eof_is_empty_not_truncated() {
+        let (bytes, truncated) = win(b"hello", Some(5), None, BIG_CAP);
         assert!(bytes.is_empty());
         assert!(!truncated);
     }
 
     #[test]
-    fn slice_bytes_offset_past_eof_clamps() {
-        let (bytes, truncated) = slice_bytes(b"hello", Some(99), Some(4));
+    fn read_window_offset_past_eof_clamps() {
+        let (bytes, truncated) = win(b"hello", Some(99), Some(4), BIG_CAP);
         assert!(bytes.is_empty());
         assert!(!truncated);
+    }
+
+    #[test]
+    fn read_window_caps_unbounded_request() {
+        // No explicit limit, but the cap bounds the read and flags truncation
+        // so a huge in-root file cannot force a full-file host allocation.
+        let (bytes, truncated) = win(b"0123456789", None, None, 4);
+        assert_eq!(bytes, b"0123");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn read_window_limit_above_cap_is_capped() {
+        let (bytes, truncated) = win(b"0123456789", None, Some(999), 4);
+        assert_eq!(bytes, b"0123");
+        assert!(truncated);
     }
 
     #[test]
