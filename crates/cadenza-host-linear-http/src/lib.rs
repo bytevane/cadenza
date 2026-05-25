@@ -66,7 +66,17 @@ impl ReqwestLinearTransport {
     /// must not be called from within an async runtime (the production wiring
     /// constructs it on the host, off any runtime).
     pub fn new(token: impl Into<String>) -> Result<Self, reqwest::Error> {
-        let client = Client::builder().build()?;
+        // Disable automatic redirect following: the `LinearCapability`
+        // allowlist is the *sole* egress authority and is checked only against
+        // the configured endpoint before dispatch. If reqwest followed a 30x
+        // from that endpoint, the GraphQL POST (query + variables) would be
+        // re-sent to a URL that was never allowlisted, breaking egress
+        // containment and risking payload leakage (PR #88 codex P1). With
+        // `Policy::none()` a redirect is returned as a 3xx response, which
+        // `execute` maps to a fail-closed `Upstream` error instead.
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
         Ok(Self {
             token: token.into(),
             client,
@@ -148,9 +158,13 @@ impl LinearTransport for ReqwestLinearTransport {
 fn read_body_capped(resp: Response, max: usize) -> Result<String, LinearTransportError> {
     // `reqwest::blocking::Response` implements `std::io::Read`. Read one byte
     // past the cap so an exactly-`max` body is accepted while anything larger is
-    // detected without reading it all.
+    // detected without reading it all. `saturating_add` guards the `max ==
+    // usize::MAX` host-config edge (an effectively-unbounded cap): `+ 1` would
+    // overflow there — panicking in debug, wrapping to a 0-byte read in release
+    // (PR #88 codex P2). At the saturated ceiling nothing can exceed the cap, so
+    // the body is returned in full as intended.
     let mut buf = Vec::new();
-    resp.take(max as u64 + 1)
+    resp.take((max as u64).saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| LinearTransportError::Io(format!("read response body: {e}")))?;
     if buf.len() > max {
@@ -391,5 +405,56 @@ mod tests {
             matches!(err, LinearTransportError::Upstream(ref m) if m.contains("too large")),
             "got {err:?}",
         );
+    }
+
+    // PR #88 codex P1 (egress containment): a 30x from the allowlisted endpoint
+    // must NOT be auto-followed to an un-allowlisted URL. With redirects disabled
+    // the redirect surfaces as a fail-closed `Upstream`; the `Location` (an
+    // unreachable port) is never dialled. Mutation: drop `Policy::none()` and the
+    // client follows the redirect, fails to connect, and returns `Io` instead.
+    #[test]
+    fn redirect_is_not_followed_and_surfaces_upstream() {
+        let url = serve_once(|mut stream| {
+            read_request(&mut stream).ok();
+            // 302 pointing at a port nothing listens on.
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/evil\r\nContent-Length: 0\r\n\r\n",
+                )
+                .ok();
+        });
+        let transport = ReqwestLinearTransport::new("lr_live_HOSTONLY").unwrap();
+        let err = transport
+            .execute(call(&url, Duration::from_secs(5), 1024))
+            .expect_err("a redirect must not be followed");
+        assert!(
+            matches!(err, LinearTransportError::Upstream(_)),
+            "redirect should surface as Upstream (not be followed), got {err:?}",
+        );
+    }
+
+    // PR #88 codex P2: `max_response_bytes == usize::MAX` (an effectively-
+    // unbounded host config) must not break responses. The cap arithmetic
+    // saturates instead of overflowing (which would panic in debug / read 0 bytes
+    // in release). Mutation: revert to `max as u64 + 1` and this panics on the
+    // overflow under the test (debug) build.
+    #[test]
+    fn unbounded_cap_returns_body_without_overflow() {
+        let url = serve_once(|mut stream| {
+            read_request(&mut stream).ok();
+            let body = r#"{"data":{"ok":true}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).ok();
+        });
+        let transport = ReqwestLinearTransport::new("lr_live_HOSTONLY").unwrap();
+        let res = transport
+            .execute(call(&url, Duration::from_secs(5), usize::MAX))
+            .expect("an unbounded cap must still return the body");
+        assert_eq!(res.status, 200);
+        assert!(res.body_json.contains("\"ok\":true"));
     }
 }

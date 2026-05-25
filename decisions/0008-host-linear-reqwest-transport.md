@@ -118,6 +118,17 @@ this. This ADR adds the transport that consumes it.
    implementations set their own deadline from `LinearCall::timeout` and abort
    (not complete) on it.
 
+5a. **Automatic redirects are disabled (`redirect::Policy::none()`).** The
+   `LinearCapability` allowlist is the *sole* egress authority and is checked only
+   against the configured endpoint before dispatch. If reqwest followed a 30x
+   from that endpoint, the GraphQL POST (query + variables) would be re-sent to a
+   URL that was never allowlisted — breaking egress containment and risking
+   payload leakage (PR #88 review P1). With redirects off, a 30x is returned as a
+   3xx response, which the error mapping (point 7) turns into a fail-closed
+   `Upstream` error rather than a silent cross-origin re-send. The cap arithmetic
+   also saturates rather than `+ 1`-ing so a `max_response_bytes == usize::MAX`
+   host config does not overflow (PR #88 review P2).
+
 6. **The transport bounds its own response read to `LinearCall::max_response_bytes`.**
    It reads the body through a capped reader and fails closed if the body exceeds
    the cap, so an oversized upstream response cannot force a large host
