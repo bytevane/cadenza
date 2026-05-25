@@ -92,7 +92,14 @@ example plugin exercise it. Several frozen contracts sit in the blast radius:
    a GraphQL `errors` array) is returned as `graphql-response` (status +
    body-json); only HTTP/transport-level failures become `host-error`.
 
-8. **Audit with canonical, redacted fields.** Every `linear-graphql` call —
+8. **Bounded response body + validated variables.** The GraphQL response body
+   handed back to the guest is bounded by the runtime's existing
+   `max_http_body_bytes`; an oversized upstream body fails with a typed
+   `upstream` error rather than forcing a large host allocation or breaching
+   guest memory. `variables-json` must be a JSON **object** (a GraphQL
+   variables map), not just any valid JSON; empty input normalises to `{}`.
+
+9. **Audit with canonical, redacted fields.** Every `linear-graphql` call —
    success, denial, or error — records one host-call log entry stamped with
    issue/plugin context and a structured `fields-json` keyed by new
    `cadenza-obs` field-name constants: `operation_name`, `query_fingerprint`,
@@ -118,3 +125,10 @@ example plugin exercise it. Several frozen contracts sit in the blast radius:
 - Real outbound HTTP for the transport (a `reqwest`-backed impl wiring the
   operator's token) is left to the integration/orchestrator layer; this PR
   ships the host boundary, the policy, and a mock transport for tests.
+- The synchronous `LinearTransport::execute` call has no host-enforced
+  wall-clock timeout in this PR — wasmtime's epoch interruption preempts guest
+  code, not a blocked host call. The mock transport returns immediately, so the
+  hang vector is not reachable until a real network transport lands; enforcing
+  a host-side timeout (or requiring the transport to set its own client
+  deadline) is tracked as a follow-up that must be resolved together with the
+  real HTTP transport.

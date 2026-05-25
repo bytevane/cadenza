@@ -104,6 +104,11 @@ pub struct StoreState {
     pub limiter: RuntimeLimiter,
     pub request: RequestContext,
     caps: HostCapabilities,
+    /// Max bytes a host capability may hand back to the guest in a single
+    /// response body (the runtime's `max_http_body_bytes`). Enforced by
+    /// `host-linear` on the GraphQL response so an oversized upstream body
+    /// cannot force a large host allocation or breach guest memory.
+    http_body_limit: usize,
 }
 
 impl StoreState {
@@ -545,6 +550,7 @@ impl ComponentRuntime {
             limiter: RuntimeLimiter::new(&self.limits),
             request,
             caps,
+            http_body_limit: self.limits.max_http_body_bytes,
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limiter);

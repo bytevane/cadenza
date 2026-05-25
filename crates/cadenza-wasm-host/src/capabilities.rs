@@ -254,14 +254,20 @@ impl StoreState {
             ));
         }
         // Normalise/validate variables: empty means `{}`; anything present
-        // must parse as JSON so a malformed body fails before the request.
+        // must parse as a JSON *object* — GraphQL request variables are a
+        // name→value map, so a scalar/array is rejected before the request.
         let trimmed = variables_json.trim();
         let normalised_vars = if trimmed.is_empty() {
             "{}".to_string()
         } else {
-            serde_json::from_str::<serde_json::Value>(trimmed).map_err(|e| {
+            let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
                 HostError::InvalidArgument(format!("variables-json is not valid JSON: {e}"))
             })?;
+            if !parsed.is_object() {
+                return Err(HostError::InvalidArgument(
+                    "variables-json must be a JSON object".to_string(),
+                ));
+            }
             trimmed.to_string()
         };
 
@@ -273,10 +279,23 @@ impl StoreState {
             endpoint: cap.endpoint().to_string(),
         };
         match cap.transport().execute(call) {
-            Ok(res) => Ok(GraphqlResponse {
-                status: res.status,
-                body_json: res.body_json,
-            }),
+            Ok(res) => {
+                // Bound the response body crossing into guest memory by the
+                // runtime's configured `max_http_body_bytes`. A transport or
+                // upstream returning an oversized body fails with a typed error
+                // rather than forcing a large host allocation / guest-memory
+                // breach.
+                if res.body_json.len() > self.http_body_limit {
+                    return Err(HostError::Upstream(format!(
+                        "linear response body exceeds the configured limit of {} bytes",
+                        self.http_body_limit
+                    )));
+                }
+                Ok(GraphqlResponse {
+                    status: res.status,
+                    body_json: res.body_json,
+                })
+            }
             Err(err) => Err(map_linear_transport_error(err, &self.caps.scrubber)),
         }
     }
@@ -838,7 +857,15 @@ mod tests {
         cap: Option<LinearCapability>,
         scrubber: Scrubber,
     ) -> wasmtime::Store<StoreState> {
-        let rt = ComponentRuntime::new(WasmRuntimeLimits::default()).unwrap();
+        linear_store_with(WasmRuntimeLimits::default(), cap, scrubber)
+    }
+
+    fn linear_store_with(
+        limits: WasmRuntimeLimits,
+        cap: Option<LinearCapability>,
+        scrubber: Scrubber,
+    ) -> wasmtime::Store<StoreState> {
+        let rt = ComponentRuntime::new(limits).unwrap();
         let log_sink = LogSink::new();
         rt.new_store_with(
             RequestContext {
@@ -949,6 +976,55 @@ mod tests {
         assert!(
             transport.calls().is_empty(),
             "rejected call hit the transport"
+        );
+    }
+
+    #[test]
+    fn linear_non_object_variables_are_rejected() {
+        // Valid JSON but not an object — GraphQL variables must be a map.
+        let transport = MockTransport::ok("{}");
+        let cap = LinearCapability::with_default_allowlist(transport.clone());
+        let mut store = linear_store(Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                "[1,2,3]".to_string(),
+                GraphqlMode::Read,
+            )
+            .expect_err("array variables must be rejected");
+        assert!(matches!(err, HostError::InvalidArgument(_)), "got {err:?}");
+        assert!(
+            transport.calls().is_empty(),
+            "rejected call hit the transport"
+        );
+    }
+
+    #[test]
+    fn linear_oversized_response_body_is_rejected() {
+        // A response body larger than the runtime's max_http_body_bytes must
+        // not cross into guest memory; it fails with a typed error instead.
+        let limits = WasmRuntimeLimits {
+            max_http_body_bytes: 16,
+            ..Default::default()
+        };
+        let big = "x".repeat(64);
+        let transport = MockTransport::ok(&big);
+        let cap = LinearCapability::with_default_allowlist(transport);
+        let mut store = linear_store_with(limits, Some(cap), Scrubber::empty());
+        let err = store
+            .data_mut()
+            .linear_graphql(
+                None,
+                "query { viewer { id } }".to_string(),
+                String::new(),
+                GraphqlMode::Read,
+            )
+            .expect_err("oversized body must be rejected");
+        assert!(
+            matches!(err, HostError::Upstream(ref m) if m.contains("exceeds")),
+            "got {err:?}",
         );
     }
 
