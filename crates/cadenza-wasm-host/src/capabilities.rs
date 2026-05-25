@@ -200,14 +200,14 @@ impl ComponentRuntime {
         // host functions, satisfying the issue's "minimal capability"
         // requirement.
         //
-        // Wasmtime's own `define_unknown_imports_as_traps` is used to install
-        // the structural stubs (resource types, nested instances, the
-        // recursion across the component's full import tree). On top of that
-        // we override every function stub with a typed `DeferredCapability`
-        // closure, so a guest call into a deferred capability surfaces in
-        // `classify_trap` as `WasmHostError::CapabilityDenied` rather than
-        // the less-precise `LimitBreached` a stringly-typed trap would land
-        // on (issue #75 case 2).
+        // `define_imports_as_capability_denied` does the stubbing: it walks
+        // the component's full import tree and gives each *function* import a
+        // typed `DeferredCapability` closure, so a guest call into a deferred
+        // capability surfaces in `classify_trap` as
+        // `WasmHostError::CapabilityDenied` rather than the less-precise
+        // `LimitBreached` a stringly-typed trap would land on (issue #75 case
+        // 2). It deliberately does NOT use wasmtime's own
+        // `define_unknown_imports_as_traps` — see that function's doc for why.
         linker.allow_shadowing(true);
         define_imports_as_capability_denied(&mut linker, &loaded.component, self.engine())?;
         add_host_capabilities(&mut linker)?;
@@ -674,6 +674,13 @@ fn read_window<R: Read + Seek>(
 /// (`CapabilityDenied`). Downcasting the typed payloads first means an over-cap
 /// declared memory/table no longer mislabels as `Link`, and a deferred host
 /// import called during init no longer mislabels as `LimitBreached`.
+///
+/// One resource-limit sub-case is deliberately left as `Link`: a *count*-cap
+/// breach (too many instances/tables/memories, enforced by wasmtime via
+/// `Store::bump_resource_counts`) bails with a plain string and carries no
+/// typed payload or `Trap` in wasmtime 45, so there is no non-fragile signal
+/// to downcast. Fixing that precisely needs upstream support and is out of
+/// scope for #75 (whose example is the size-growth path handled above).
 pub(crate) fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
     if let Some(breach) = err.downcast_ref::<crate::ResourceLimitBreached>() {
         return WasmHostError::LimitBreached(breach.to_string());
