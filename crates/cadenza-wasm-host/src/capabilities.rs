@@ -35,8 +35,8 @@ pub use cadenza::runtime::types::{
 };
 
 /// Wire the four in-scope host interfaces into `linker`. The guest's
-/// incidental WASI imports are satisfied separately by
-/// `wasmtime_wasi::add_to_linker_sync` in [`ComponentRuntime::run_tool`].
+/// incidental WASI imports are stubbed as traps in
+/// [`ComponentRuntime::run_tool`] rather than granted.
 pub(crate) fn add_host_capabilities(linker: &mut Linker<StoreState>) -> Result<(), WasmHostError> {
     let link_err = |e: wasmtime::Error| WasmHostError::Link(e.to_string());
     cadenza::runtime::host_log::add_to_linker::<_, HasSelf<StoreState>>(linker, |s| s)
@@ -64,9 +64,19 @@ impl ComponentRuntime {
         input: ToolInput,
     ) -> Result<Result<ToolOutput, HostError>, WasmHostError> {
         let mut linker = Linker::<StoreState>::new(self.engine());
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
+        // Stub *every* import as a trap first, then shadow the four in-scope
+        // host interfaces with their real implementations. The guest's
+        // incidental WASI imports (from the Rust std runtime) therefore grant
+        // nothing — no preopens, env, clocks, random, sockets, or filesystem
+        // reach the guest; a guest that calls a WASI function traps (surfaced
+        // via `classify_trap`). The only live capabilities are the four host
+        // functions, satisfying the issue's "minimal capability" requirement.
+        linker.allow_shadowing(true);
+        linker
+            .define_unknown_imports_as_traps(&loaded.component)
             .map_err(|e| WasmHostError::Link(e.to_string()))?;
         add_host_capabilities(&mut linker)?;
+        linker.allow_shadowing(false);
         let bindings = ToolRuntime::instantiate(&mut *store, &loaded.component, &linker)
             .map_err(|e| WasmHostError::Link(format!("instantiate: {e}")))?;
         let result = bindings
@@ -432,5 +442,40 @@ mod tests {
         assert_eq!(cadenza_obs::fields::FIELD_ISSUE_ID, "issue_id");
         assert_eq!(cadenza_obs::fields::FIELD_PLUGIN_NAME, "plugin_name");
         assert_eq!(cadenza_obs::fields::FIELD_COMPONENT, "component");
+    }
+
+    // Guards the symlink half of containment specifically: lexical `safe_join`
+    // passes a symlink that lives inside the root, so only `canonicalize_inside`
+    // catches the escape. Removing that call makes this test read the outside
+    // target and fail.
+    #[cfg(unix)]
+    #[test]
+    fn read_workspace_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("ws");
+        let outside = outer.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"sensitive").unwrap();
+        // A symlink that *lexically* lives inside the root but resolves out.
+        symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
+
+        let rt = crate::ComponentRuntime::new(crate::WasmRuntimeLimits::default()).unwrap();
+        let store = rt.new_store_with(
+            crate::RequestContext {
+                workspace_path: Some(root.clone()),
+                ..Default::default()
+            },
+            crate::HostCapabilities::default(),
+        );
+
+        let err = read_workspace(store.data(), "link.txt".to_string(), None, None, true)
+            .expect_err("symlink escape must be denied");
+        assert!(
+            matches!(err, HostError::OutsideRoot),
+            "symlink escape must map to outside-root, got {err:?}",
+        );
     }
 }

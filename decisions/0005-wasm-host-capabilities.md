@@ -55,10 +55,16 @@ blast radius:
    `docs/operations/wit-abi-versioning.md` this is recorded here as
    additive-only.
 
-3. **Link only the four in-scope interfaces.** The `Linker` defines
-   `host-log`, `host-time`, `host-workspace`, `host-secrets`. The example
-   guest imports only those, so instantiation succeeds without `host-http` /
-   `host-linear` / `host-tools`, which remain deferred to their own issues.
+3. **Link only the four in-scope interfaces; trap everything else.** The
+   `Linker` defines real implementations for `host-log`, `host-time`,
+   `host-workspace`, `host-secrets`. The example guest also pulls in
+   incidental WASI imports via the Rust std runtime; rather than granting any
+   WASI capability, every unknown import is stubbed as a trap
+   (`Linker::define_unknown_imports_as_traps`) and the four host interfaces
+   are then shadowed in with their real impls. The guest therefore gets no
+   filesystem, env, clocks, random, or sockets — only the four host
+   functions. `host-http` / `host-linear` / `host-tools` remain deferred to
+   their own issues; a guest importing them would trap until then.
 
 4. **Capability implementations (`cadenza-wasm-host`):**
    - `now-millis` reads an injectable `HostClock` (system by default; a fixed

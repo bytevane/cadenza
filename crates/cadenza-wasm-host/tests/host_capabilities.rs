@@ -80,7 +80,7 @@ fn runtime() -> ComponentRuntime {
     // component's function table needs more than that. Use a roomier cap so
     // a genuine component instantiates; capability behaviour is what these
     // tests exercise, not the resource-limit edges (those live in the unit
-    // tests). The limiter's count/size conflation is tracked as a follow-up.
+    // tests). The limiter's count/size conflation is tracked in #74.
     let limits = WasmRuntimeLimits {
         max_tables: 10_000,
         ..Default::default()

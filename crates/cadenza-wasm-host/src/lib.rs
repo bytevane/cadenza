@@ -11,9 +11,9 @@
 //! Wasmtime `Linker` by [`ComponentRuntime::run_tool`]. The store carries a
 //! [`RequestContext`] (issue/plugin identity + workspace root), a
 //! [`HostCapabilities`] bundle (configured secret names, redaction scrubber,
-//! clock, captured log sink), the `RuntimeLimiter`, and a locked-down WASI
-//! context that satisfies only the language-runtime imports the guest pulls
-//! in (no preopens, no inherited env/stdio) — see ADR 0005.
+//! clock, captured log sink) and the `RuntimeLimiter`. The guest's incidental
+//! WASI imports are stubbed as traps (not granted) during linking, so the
+//! only live capabilities are the four host functions — see ADR 0005.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -22,9 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cadenza_obs::Scrubber;
 use serde::{Deserialize, Serialize};
-use wasmtime::component::{Component, ResourceTable};
+use wasmtime::component::Component;
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 mod capabilities;
 
@@ -96,16 +95,14 @@ pub enum WasmHostError {
 
 /// Per-instance store payload read by the host capability functions in
 /// [`capabilities`]. Holds the resource limiter, the per-request identity and
-/// workspace root ([`RequestContext`]), the host-side capability config
-/// ([`HostCapabilities`]), and a locked-down WASI context (no preopens, no
-/// inherited env/stdio) that only satisfies the language-runtime imports the
-/// guest emits — workspace access is exclusively via `host-workspace`.
+/// workspace root ([`RequestContext`]), and the host-side capability config
+/// ([`HostCapabilities`]). Workspace access is exclusively via
+/// `host-workspace`; the guest's incidental WASI imports are trapped, not
+/// granted (see [`ComponentRuntime::run_tool`]).
 pub struct StoreState {
     pub limiter: RuntimeLimiter,
     pub request: RequestContext,
     caps: HostCapabilities,
-    wasi: WasiCtx,
-    table: ResourceTable,
 }
 
 impl StoreState {
@@ -119,15 +116,6 @@ impl StoreState {
     /// additionally records the (redacted) level/message/fields.
     pub fn log_sink(&self) -> &LogSink {
         &self.caps.log_sink
-    }
-}
-
-impl WasiView for StoreState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.wasi,
-            table: &mut self.table,
-        }
     }
 }
 
@@ -376,9 +364,9 @@ impl ComponentRuntime {
 
     /// Like [`ComponentRuntime::new_store`] but with explicit host
     /// capabilities (configured secret names, redaction scrubber, clock, log
-    /// sink). The WASI context is locked down: no preopened directories, no
-    /// inherited environment or stdio, so the only filesystem reach the guest
-    /// has is the contained `host-workspace.workspace-read` capability.
+    /// sink). The guest reaches the filesystem only through the contained
+    /// `host-workspace.workspace-read` capability; incidental WASI imports are
+    /// trapped during linking (see [`ComponentRuntime::run_tool`]).
     pub fn new_store_with(
         &self,
         request: RequestContext,
@@ -393,8 +381,6 @@ impl ComponentRuntime {
             limiter: RuntimeLimiter::new(&self.limits),
             request,
             caps,
-            wasi: WasiCtxBuilder::new().build(),
-            table: ResourceTable::new(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limiter);
