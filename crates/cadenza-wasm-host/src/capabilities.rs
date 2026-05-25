@@ -209,8 +209,16 @@ fn read_workspace(
     // 2. Symlink-aware containment; a missing file surfaces here as not-found.
     cadenza_workspace::canonicalize_inside(root.as_path(), candidate.as_std_path())
         .map_err(map_workspace_error)?;
-
-    let all = std::fs::read(candidate.as_std_path()).map_err(map_io_error)?;
+    // 3. Read the *resolved* path, not the lexical one, so a symlink in an
+    //    intermediate path component cannot be swapped between the check above
+    //    and the read to escape the root. A residual race on the final
+    //    component is a known std limitation; a write-capable workspace API
+    //    will need O_NOFOLLOW/openat2 (SECURITY.md) and is out of scope here.
+    let resolved = candidate
+        .as_std_path()
+        .canonicalize()
+        .map_err(map_io_error)?;
+    let all = std::fs::read(&resolved).map_err(map_io_error)?;
     let (bytes, truncated) = slice_bytes(&all, offset, limit);
 
     if as_text && std::str::from_utf8(&bytes).is_err() {
@@ -294,9 +302,11 @@ fn scrub_json(
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, v) in map {
                 // A secret-shaped key with a non-string value (number, bool,
-                // nested object) is still redacted wholesale.
+                // nested object) is still redacted wholesale. Route through
+                // the scrubber so the redaction marker stays owned by
+                // cadenza-obs rather than duplicated here.
                 let new_v = if cadenza_obs::looks_secret(&k) && !v.is_string() {
-                    Value::String("[REDACTED]".to_string())
+                    Value::String(scrubber.redact_key_value(&k, ""))
                 } else {
                     scrub_json(scrubber, Some(&k), v)
                 };
