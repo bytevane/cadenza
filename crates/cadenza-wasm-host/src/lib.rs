@@ -506,7 +506,12 @@ impl EpochTicker {
     /// Spawn a ticker advancing `engine`'s epoch every `interval`. The thread
     /// owns its own `Engine` clone (engines are `Arc`-backed, so this is the
     /// *same* epoch counter the runtime's stores observe).
-    fn spawn(engine: Engine, interval: Duration) -> Self {
+    ///
+    /// Fallible: OS thread creation can fail under PID/thread limits or memory
+    /// pressure. The error is propagated rather than panicked so a runtime
+    /// built under load fails closed with a typed `WasmHostError`, matching the
+    /// fallible contract of [`ComponentRuntime::new`].
+    fn spawn(engine: Engine, interval: Duration) -> std::io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_signal = Arc::clone(&stop);
         let handle = std::thread::Builder::new()
@@ -516,12 +521,11 @@ impl EpochTicker {
                     std::thread::sleep(interval);
                     engine.increment_epoch();
                 }
-            })
-            .expect("spawn cadenza epoch ticker thread");
-        Self {
+            })?;
+        Ok(Self {
             stop,
             handle: Some(handle),
-        }
+        })
     }
 }
 
@@ -558,8 +562,11 @@ impl ComponentRuntime {
         let engine = Engine::new(&config).map_err(|e| WasmHostError::Engine(e.to_string()))?;
         // Start advancing the epoch immediately so any store's deadline can
         // fire. Without this, `set_epoch_deadline` never trips and a CPU-bound
-        // guest runs forever (issue #62).
-        let ticker = EpochTicker::spawn(engine.clone(), EPOCH_TICK_INTERVAL);
+        // guest runs forever (issue #62). A thread-spawn failure (PID/thread
+        // limits, memory pressure) fails runtime construction rather than
+        // panicking — without the ticker the timeout contract cannot hold.
+        let ticker = EpochTicker::spawn(engine.clone(), EPOCH_TICK_INTERVAL)
+            .map_err(|e| WasmHostError::Engine(format!("epoch ticker thread spawn failed: {e}")))?;
         Ok(Self {
             engine,
             limits,

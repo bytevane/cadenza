@@ -49,7 +49,7 @@ fn infinite_loop_guest_traps_with_timeout_near_budget() {
     // regression — the ticker missing, leaving the epoch frozen — fails this
     // test cleanly via the recv timeout instead of hanging the suite forever.
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let linker = Linker::new(&engine);
         let instance = linker
             .instantiate(&mut store, &component)
@@ -67,6 +67,9 @@ fn infinite_loop_guest_traps_with_timeout_near_budget() {
     // barrier that distinguishes "trapped" from "ran forever (no ticker)".
     match rx.recv_timeout(Duration::from_secs(10)) {
         Ok((Err(WasmHostError::Timeout), elapsed)) => {
+            // Worker has sent its result and is returning — join it instead of
+            // leaving a detached thread behind.
+            let _ = worker.join();
             // Trapped via epoch interruption — proves the engine epoch was
             // advanced. The nominal budget is ~100ms; this 5s upper bound is
             // deliberately generous (a brutally loaded box can stretch 1ms
@@ -78,9 +81,14 @@ fn infinite_loop_guest_traps_with_timeout_near_budget() {
             );
         }
         Ok((other, elapsed)) => {
+            let _ = worker.join();
             panic!("expected WasmHostError::Timeout, got {other:?} after {elapsed:?}");
         }
         Err(_) => {
+            // The worker is wedged in the infinite guest loop precisely because
+            // the epoch never advanced (the regression under test), so it
+            // cannot be joined — `join` would block forever. Abandon it and
+            // fail; the test process exits right after this panic, reaping it.
             panic!(
                 "guest never trapped within 10s: the engine epoch is not being \
                  advanced, so epoch_timeout_ms can never fire (issue #62)",
