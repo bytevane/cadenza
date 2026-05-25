@@ -1,4 +1,162 @@
 package root:component;
 
 world root {
+  import cadenza:runtime/types@0.2.0;
+  import cadenza:runtime/host-log@0.2.0;
+  import cadenza:runtime/host-time@0.2.0;
+  import cadenza:runtime/host-workspace@0.2.0;
+  import cadenza:runtime/host-secrets@0.2.0;
+  import wasi:io/poll@0.2.6;
+  import wasi:io/error@0.2.6;
+  import wasi:io/streams@0.2.6;
+  import wasi:cli/environment@0.2.6;
+  import wasi:cli/exit@0.2.6;
+  import wasi:cli/stdin@0.2.6;
+  import wasi:cli/stdout@0.2.6;
+  import wasi:cli/stderr@0.2.6;
+  import wasi:cli/terminal-input@0.2.6;
+  import wasi:cli/terminal-output@0.2.6;
+  import wasi:cli/terminal-stdin@0.2.6;
+  import wasi:cli/terminal-stdout@0.2.6;
+  import wasi:cli/terminal-stderr@0.2.6;
+
+  export cadenza:runtime/tool@0.2.0;
+}
+package cadenza:runtime@0.2.0 {
+  interface types {
+    enum log-level {
+      trace,
+      debug,
+      info,
+      warn,
+      error,
+    }
+
+    variant host-error {
+      denied(string),
+      invalid-argument(string),
+      not-found(string),
+      outside-root,
+      timeout,
+      rate-limited(option<u32>),
+      upstream(string),
+      io(string),
+      internal(string),
+    }
+
+    record workspace-read-result {
+      path: string,
+      bytes: list<u8>,
+      truncated: bool,
+    }
+
+    record tool-input {
+      name: string,
+      args-json: string,
+    }
+
+    record tool-output {
+      result-json: string,
+      is-error: bool,
+    }
+  }
+  interface host-log {
+    use types.{log-level, host-error};
+
+    log: func(level: log-level, target: option<string>, message: string, fields-json: option<string>) -> result<_, host-error>;
+  }
+  interface host-time {
+    now-millis: func() -> u64;
+  }
+  interface host-workspace {
+    use types.{workspace-read-result, host-error};
+
+    workspace-read: func(path: string, offset: option<u64>, limit: option<u64>, as-text: bool) -> result<workspace-read-result, host-error>;
+  }
+  interface host-secrets {
+    use types.{host-error};
+
+    secret-exists: func(name: string) -> result<bool, host-error>;
+  }
+  interface tool {
+    use types.{host-error, tool-input, tool-output};
+
+    run: func(input: tool-input) -> result<tool-output, host-error>;
+  }
+}
+
+
+package wasi:io@0.2.6 {
+  interface poll {
+    resource pollable {
+      block: func();
+    }
+  }
+  interface error {
+    resource error;
+  }
+  interface streams {
+    use error.{error};
+    use poll.{pollable};
+
+    resource input-stream;
+
+    resource output-stream {
+      check-write: func() -> result<u64, stream-error>;
+      write: func(contents: list<u8>) -> result<_, stream-error>;
+      blocking-flush: func() -> result<_, stream-error>;
+      subscribe: func() -> pollable;
+    }
+
+    variant stream-error {
+      last-operation-failed(error),
+      closed,
+    }
+  }
+}
+
+
+package wasi:cli@0.2.6 {
+  interface environment {
+    get-environment: func() -> list<tuple<string, string>>;
+  }
+  interface exit {
+    exit: func(status: result);
+  }
+  interface stdin {
+    use wasi:io/streams@0.2.6.{input-stream};
+
+    get-stdin: func() -> input-stream;
+  }
+  interface stdout {
+    use wasi:io/streams@0.2.6.{output-stream};
+
+    get-stdout: func() -> output-stream;
+  }
+  interface stderr {
+    use wasi:io/streams@0.2.6.{output-stream};
+
+    get-stderr: func() -> output-stream;
+  }
+  interface terminal-input {
+    resource terminal-input;
+  }
+  interface terminal-output {
+    resource terminal-output;
+  }
+  interface terminal-stdin {
+    use terminal-input.{terminal-input};
+
+    get-terminal-stdin: func() -> option<terminal-input>;
+  }
+  interface terminal-stdout {
+    use terminal-output.{terminal-output};
+
+    get-terminal-stdout: func() -> option<terminal-output>;
+  }
+  interface terminal-stderr {
+    use terminal-output.{terminal-output};
+
+    get-terminal-stderr: func() -> option<terminal-output>;
+  }
 }

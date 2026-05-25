@@ -6,15 +6,29 @@
 //! the caller must match cadenza's frozen baseline (`WIT_PACKAGE` /
 //! `WIT_WORLD`) otherwise the loader fails closed.
 //!
-//! Host capability functions live in a future PR (#16). For now the
-//! store carries a `RequestContext` placeholder and a `RuntimeLimiter`
-//! that Wasmtime consults during instantiation.
+//! Host capability functions (`host-log`, `host-time`, `host-workspace`,
+//! `host-secrets`) are implemented in [`capabilities`] and linked into the
+//! Wasmtime `Linker` by [`ComponentRuntime::run_tool`]. The store carries a
+//! [`RequestContext`] (issue/plugin identity + workspace root), a
+//! [`HostCapabilities`] bundle (configured secret names, redaction scrubber,
+//! clock, captured log sink), the `RuntimeLimiter`, and a locked-down WASI
+//! context that satisfies only the language-runtime imports the guest pulls
+//! in (no preopens, no inherited env/stdio) — see ADR 0005.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use cadenza_obs::Scrubber;
 use serde::{Deserialize, Serialize};
-use wasmtime::component::Component;
+use wasmtime::component::{Component, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+
+mod capabilities;
+
+pub use capabilities::{HostError, LogLevel, ToolInput, ToolOutput, WorkspaceReadResult};
 
 /// Frozen WIT identity of the cadenza host. Plugins must declare the
 /// same package and world in their `WasmComponentRef`. The ABI gate
@@ -60,6 +74,8 @@ pub enum WasmHostError {
     WitWorldMismatch { expected: String, actual: String },
     #[error("component denied by capability policy: {0}")]
     CapabilityDenied(String),
+    #[error("failed to wire host capabilities into the linker: {0}")]
+    Link(String),
     #[error("component file not found: {path}")]
     NotFound { path: PathBuf },
     #[error("component compile error: {0}")]
@@ -78,22 +94,130 @@ pub enum WasmHostError {
     },
 }
 
-/// Per-instance store payload. Currently just the resource limiter and
-/// a small request-context shell; host capability functions in #16
-/// will extend this with credentials, workspace handle, etc.
+/// Per-instance store payload read by the host capability functions in
+/// [`capabilities`]. Holds the resource limiter, the per-request identity and
+/// workspace root ([`RequestContext`]), the host-side capability config
+/// ([`HostCapabilities`]), and a locked-down WASI context (no preopens, no
+/// inherited env/stdio) that only satisfies the language-runtime imports the
+/// guest emits — workspace access is exclusively via `host-workspace`.
 pub struct StoreState {
     pub limiter: RuntimeLimiter,
     pub request: RequestContext,
+    caps: HostCapabilities,
+    wasi: WasiCtx,
+    table: ResourceTable,
 }
 
-/// Caller-supplied context the host functions read on each call. No
-/// raw secret material is allowed here — credentials live in the host
-/// and are referenced by id (see SECURITY.md). The placeholder fields
-/// here are documented at the type level.
+impl StoreState {
+    /// Read-only view of the configured host capabilities.
+    pub fn caps(&self) -> &HostCapabilities {
+        &self.caps
+    }
+
+    /// The captured structured-log sink. Each host call appends a
+    /// [`HostLogRecord`] carrying issue/plugin context; the `log` capability
+    /// additionally records the (redacted) level/message/fields.
+    pub fn log_sink(&self) -> &LogSink {
+        &self.caps.log_sink
+    }
+}
+
+impl WasiView for StoreState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+/// Caller-supplied identity the host functions stamp onto every log record.
+/// No raw secret material is allowed here — credentials live in the host and
+/// `host-secrets` discloses only presence (see SECURITY.md). `workspace_path`
+/// is the containment root for `host-workspace.workspace-read`.
 #[derive(Debug, Default, Clone)]
 pub struct RequestContext {
     pub issue_id: Option<String>,
+    pub plugin_name: Option<String>,
     pub workspace_path: Option<PathBuf>,
+}
+
+/// Host-side capability configuration for a single guest invocation. None of
+/// these expose secret *values* to the guest: `secret_names` is presence-only
+/// metadata, and `scrubber` redacts secret-shaped material out of logs.
+#[derive(Debug, Default, Clone)]
+pub struct HostCapabilities {
+    /// Names of secrets the host considers present. `secret-exists` answers
+    /// from this set; the value is never stored here or disclosed.
+    pub secret_names: BTreeSet<String>,
+    /// Redaction applied to `host-log` messages and fields.
+    pub scrubber: Scrubber,
+    /// Clock backing `now-millis`; injectable so tests are deterministic.
+    pub clock: HostClock,
+    /// Structured-log capture for host calls.
+    pub log_sink: LogSink,
+}
+
+/// Clock source for `host-time.now-millis`. Defaults to the system clock;
+/// tests inject a fixed value for determinism.
+#[derive(Debug, Clone, Default)]
+pub enum HostClock {
+    #[default]
+    System,
+    Fixed(u64),
+}
+
+impl HostClock {
+    /// Milliseconds since the Unix epoch. A pre-epoch system clock clamps to
+    /// 0 rather than panicking.
+    pub fn now_millis(&self) -> u64 {
+        match self {
+            HostClock::System => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            HostClock::Fixed(v) => *v,
+        }
+    }
+}
+
+/// A single captured host-call log entry. Every host call records at least
+/// `op` + issue/plugin context; `host-log.log` also records the redacted
+/// level/message/fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostLogRecord {
+    pub op: String,
+    pub issue_id: Option<String>,
+    pub plugin_name: Option<String>,
+    pub level: Option<String>,
+    pub message: Option<String>,
+    pub fields_json: Option<String>,
+}
+
+/// Cloneable, shareable capture of [`HostLogRecord`]s. Cheap to clone (the
+/// buffer is behind an `Arc<Mutex<…>>`), so a caller can hold a handle and
+/// inspect what the guest logged after `run_tool` returns.
+#[derive(Debug, Clone, Default)]
+pub struct LogSink {
+    inner: Arc<Mutex<Vec<HostLogRecord>>>,
+}
+
+impl LogSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot of the records captured so far.
+    pub fn records(&self) -> Vec<HostLogRecord> {
+        self.inner.lock().expect("log sink mutex poisoned").clone()
+    }
+
+    pub(crate) fn push(&self, record: HostLogRecord) {
+        self.inner
+            .lock()
+            .expect("log sink mutex poisoned")
+            .push(record);
+    }
 }
 
 /// Resource limiter Wasmtime consults during memory/table growth AND
@@ -247,6 +371,19 @@ impl ComponentRuntime {
     /// deadline elapses without progress, Wasmtime traps the guest
     /// and `WasmHostError::Timeout` is returned by the caller.
     pub fn new_store(&self, request: RequestContext) -> Store<StoreState> {
+        self.new_store_with(request, HostCapabilities::default())
+    }
+
+    /// Like [`ComponentRuntime::new_store`] but with explicit host
+    /// capabilities (configured secret names, redaction scrubber, clock, log
+    /// sink). The WASI context is locked down: no preopened directories, no
+    /// inherited environment or stdio, so the only filesystem reach the guest
+    /// has is the contained `host-workspace.workspace-read` capability.
+    pub fn new_store_with(
+        &self,
+        request: RequestContext,
+        caps: HostCapabilities,
+    ) -> Store<StoreState> {
         // `RuntimeLimiter` enforces memory/table growth (size) AND
         // the instance- and table-allocation caps (count) via its
         // `instances()` / `tables()` methods. There is no separate
@@ -255,6 +392,9 @@ impl ComponentRuntime {
         let state = StoreState {
             limiter: RuntimeLimiter::new(&self.limits),
             request,
+            caps,
+            wasi: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limiter);
@@ -383,11 +523,13 @@ mod tests {
         let runtime = ComponentRuntime::new(WasmRuntimeLimits::default()).unwrap();
         let req = RequestContext {
             issue_id: Some("CAD-42".into()),
+            plugin_name: Some("example-plugin".into()),
             workspace_path: Some(PathBuf::from("/tmp/ws")),
         };
         let store = runtime.new_store(req.clone());
         let data = store.data();
         assert_eq!(data.request.issue_id.as_deref(), Some("CAD-42"));
+        assert_eq!(data.request.plugin_name.as_deref(), Some("example-plugin"));
         assert_eq!(data.request.workspace_path, Some(PathBuf::from("/tmp/ws")));
         assert_eq!(data.limiter.denied_growth(), 0);
         // Per #48 P2: the CUSTOM RuntimeLimiter must be the one wired
