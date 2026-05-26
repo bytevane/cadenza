@@ -597,25 +597,28 @@ fn table_count_cap_denial_surfaces_as_limit_breached() {
     );
 }
 
-/// Issue #63, path 3 (now scoped to the *instance* count cap by #82): an
-/// instance count-cap denial is excluded from the limiter's denial telemetry.
-/// Wasmtime enforces the instance-count cap during instantiation
-/// (`bump_resource_counts`) and never calls back into the `RuntimeLimiter`, so
-/// the limiter cannot observe the denial. wasmtime 45 also exposes no public
-/// component instance count to pre-check (unlike tables/memories, which #82 now
-/// catches as `LimitBreached`), so an instance-count breach still surfaces as
-/// `WasmHostError::Link` — a non-trap "resource limit exceeded" error, NOT a
-/// trap-derived `LimitBreached` (tracked in #86). This drives a real component
-/// against an instance count cap of 1 (a genuine wasip2 component instantiates
-/// at least 2 instances), with a roomy table cap so the instance cap is what
-/// trips, and asserts both the `Link` classification and that neither growth
-/// counter moved — codifying the documented contract on `RuntimeLimiter`.
+/// Issue #86: a component instantiating more core module instances than
+/// `max_instances` must surface as `WasmHostError::LimitBreached`, not `Link`.
+///
+/// The host pre-counts the component's static core instantiations (walking the
+/// component binary with `wasmparser`) and rejects an over-cap *before*
+/// `instantiate`, so the breach never reaches wasmtime's stringly-typed
+/// `bump_resource_counts` error that `classify_instantiate` previously could
+/// only label `Link` (the path #86 fixes; `ResourcesRequired` carries
+/// table/memory counts only, with no public component instance count, so the
+/// typed table/memory pre-check #82 introduced cannot cover this sub-case).
+///
+/// A real wasip2 component instantiates at least 2 core instances (the guest
+/// module + the WASI adapter), so a `max_instances` of 1 trips the pre-check.
+/// The table cap is left roomy so the table pre-check (#82) does not fire
+/// first — isolating the instance count-cap path. Neither growth counter must
+/// move, since the pre-check never consults the limiter at all.
 #[test]
-fn instance_count_cap_denial_surfaces_as_link_and_leaves_counters_untouched() {
+fn instance_count_cap_denial_surfaces_as_limit_breached() {
     let limits = WasmRuntimeLimits {
         // Roomy table *count* cap so the table pre-check (#82) does not trip
         // before the instance count cap — isolating the instance COUNT cap,
-        // which is the sub-case still classified as `Link`.
+        // which #86 now also surfaces precisely as `LimitBreached`.
         max_tables: 10_000,
         max_instances: 1,
         ..Default::default()
@@ -629,22 +632,16 @@ fn instance_count_cap_denial_surfaces_as_link_and_leaves_counters_untouched() {
         name: "demo".to_string(),
         args_json: "{}".to_string(),
     };
-    let outcome = rt.run_tool(&mut store, &loaded, input);
+    let err = rt
+        .run_tool(&mut store, &loaded, input)
+        .expect_err("instantiation over the instance count cap must fail");
+    assert!(
+        matches!(err, WasmHostError::LimitBreached(ref m) if m.contains("instances")),
+        "issue #86: instance count-cap breach must classify as LimitBreached, got {err:?}",
+    );
 
-    // The instance count-cap denial is a plain "resource limit exceeded" error,
-    // not a `wasmtime::Trap`, so `classify_instantiate` maps it to `Link`.
-    match outcome {
-        Err(WasmHostError::Link(msg)) => {
-            assert!(
-                msg.contains("resource limit exceeded") && msg.contains("instance count"),
-                "unexpected Link message: {msg}",
-            );
-        }
-        other => panic!("expected WasmHostError::Link for instance-count cap, got {other:?}"),
-    }
-
-    // The limiter was never consulted for the count-cap denial, so neither
-    // telemetry counter must have moved.
+    // The pre-check never consults the limiter, so neither telemetry counter
+    // must have moved — codifying the documented contract on `RuntimeLimiter`.
     assert_eq!(store.data().limiter.denied_growth(), 0);
     assert_eq!(store.data().limiter.grow_failed_after_allow(), 0);
 }

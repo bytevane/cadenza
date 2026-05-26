@@ -530,14 +530,13 @@ impl LogSink {
 /// (`bump_resource_counts`) and does *not* call back into the limiter when a cap
 /// is hit — the limiter cannot observe a count-cap denial, so neither counter
 /// moves for it. Classifying such a denial is handled outside this limiter: the
-/// host pre-checks the typed `Component::resources_required` table/memory counts
-/// before instantiation and surfaces an over-cap as
-/// [`WasmHostError::LimitBreached`] (issue #82; see
-/// `capabilities::check_declared_resource_counts`). The *instance* count-cap
-/// breach — which wasmtime 45 exposes no public count to pre-check — still bails
-/// with a plain `"resource limit exceeded"` string (not a `wasmtime::Trap`) and
-/// surfaces as [`WasmHostError::Link`] (see `classify_instantiate`; tracked in
-/// #86).
+/// host pre-checks the component's declared resource counts before
+/// instantiation and surfaces an over-cap as [`WasmHostError::LimitBreached`]
+/// directly. Table and memory counts come from the typed
+/// `Component::resources_required` summary (issue #82); component instance
+/// counts come from a `wasmparser` walk of the component binary (issue #86,
+/// ADR 0009) since wasmtime 45's public `ResourcesRequired` exposes no such
+/// field. See `capabilities::check_declared_resource_counts`.
 #[derive(Debug, Clone)]
 pub struct RuntimeLimiter {
     max_memory_bytes: usize,
@@ -824,10 +823,23 @@ impl ComponentRuntime {
         })?;
         let component_handle = Component::new(&self.engine, &bytes)
             .map_err(|e| WasmHostError::Compile(e.to_string()))?;
+        // Pre-count the component's static core module instantiations so an
+        // over-cap can be classified precisely as `LimitBreached` at run_tool
+        // time (issue #86, ADR 0009). wasmtime 45's public API exposes table
+        // and memory counts via `Component::resources_required` but no
+        // component instance count, so the host walks the component binary
+        // itself to derive the same number `bump_resource_counts` enforces.
+        // A parse failure here means the bytes wasmtime just compiled
+        // successfully are nonetheless malformed under wasmparser's view —
+        // surface as `Compile` so the caller treats it like any other
+        // structural rejection rather than as a runtime resource breach.
+        let core_instance_count = crate::capabilities::count_component_core_instances(&bytes)
+            .map_err(|e| WasmHostError::Compile(format!("count core instances: {e}")))?;
         Ok(LoadedComponent {
             name: component.name.clone(),
             path: component.path.clone(),
             component: component_handle,
+            core_instance_count,
         })
     }
 
@@ -893,6 +905,13 @@ pub struct LoadedComponent {
     pub name: String,
     pub path: PathBuf,
     pub component: Component,
+    /// Number of static core module instantiations declared by the component
+    /// binary (counted by walking with `wasmparser` at load time). Compared
+    /// against `WasmRuntimeLimits::max_instances` in the run_tool pre-check
+    /// so an over-cap surfaces as `WasmHostError::LimitBreached` rather than
+    /// the stringly-typed wasmtime `bump_resource_counts` error that
+    /// `classify_instantiate` could only label `Link` (issue #86, ADR 0009).
+    pub(crate) core_instance_count: u32,
 }
 
 impl std::fmt::Debug for LoadedComponent {
