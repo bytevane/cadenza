@@ -44,6 +44,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 wasmtime = { version = "45", features = ["async", "component-model"] }
 wasmtime-wasi = "45"
 wasmtime-wasi-http = "45"
+# Component-binary walker. Pinned to the version wasmtime 45 already pulls in
+# transitively (see Cargo.lock) so no extra wasmparser copy enters the build.
+# Used by `cadenza-wasm-host` to pre-count a component's static core
+# instantiations before `Component::instantiate`, so an over-cap surfaces as
+# `WasmHostError::LimitBreached` rather than the stringly-typed wasmtime error
+# `classify_instantiate` could only label `Link` (issue #86, ADR 0009).
+wasmparser = "0.244"
 # Guest-side WIT bindings generator. Pinned by tools/versions.toml
 # (wasm.wit_bindgen_version).
 wit-bindgen = "0.57.1"

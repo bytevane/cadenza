@@ -200,14 +200,21 @@ impl ComponentRuntime {
         // `Link` (issue #82). The caps are read from the very `RuntimeLimiter`
         // wasmtime enforces against, so for this fresh store it mirrors
         // wasmtime's own boundary — it just runs first with a typed cause.
-        let (table_cap, memory_cap) = {
+        let (table_cap, memory_cap, instance_cap) = {
             let limiter = &store.data().limiter;
             (
                 ResourceLimiter::tables(limiter),
                 ResourceLimiter::memories(limiter),
+                ResourceLimiter::instances(limiter),
             )
         };
-        check_declared_resource_counts(&loaded.component, table_cap, memory_cap)?;
+        check_declared_resource_counts(
+            &loaded.component,
+            loaded.core_instance_count,
+            table_cap,
+            memory_cap,
+            instance_cap,
+        )?;
         let mut linker = Linker::<StoreState>::new(self.engine());
         // Stub *every* import first, then shadow the in-scope host interfaces
         // with their real implementations. The guest's incidental WASI
@@ -818,15 +825,17 @@ fn read_window<R: Read + Seek>(
 /// declared memory/table no longer mislabels as `Link`, and a deferred host
 /// import called during init no longer mislabels as `LimitBreached`.
 ///
-/// Table/memory *count*-cap breaches never reach this function: they are
-/// caught before instantiation by [`check_declared_resource_counts`], which
-/// reads the typed [`wasmtime::component::Component::resources_required`] counts
-/// and surfaces an over-cap as `LimitBreached` directly (issue #82). The
-/// remaining sub-case — an *instance* count-cap breach — is still left as
-/// `Link`: wasmtime 45 exposes no public component instance count to pre-check,
-/// and its `Store::bump_resource_counts` bails with a plain string carrying no
-/// typed payload or `Trap` to downcast. Fixing that precisely needs upstream
-/// support and is tracked in #86.
+/// Resource *count*-cap breaches never reach this function: they are caught
+/// before instantiation by [`check_declared_resource_counts`], which derives
+/// the per-component counts from the typed
+/// [`wasmtime::component::Component::resources_required`] summary (tables,
+/// memories — issue #82) and from a `wasmparser` walk of the component binary
+/// (component instance count — issue #86, ADR 0009), then surfaces an over-cap
+/// as `LimitBreached` directly. wasmtime 45 exposes no public component
+/// instance count via `ResourcesRequired`, so the wasmparser walk supplies what
+/// `Store::bump_resource_counts` would otherwise bail on as a plain string —
+/// the residual `Link` fallback below now only fires for genuine wiring
+/// failures, not for any classifiable count-cap denial.
 pub(crate) fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
     if let Some(breach) = err.downcast_ref::<crate::ResourceLimitBreached>() {
         return WasmHostError::LimitBreached(breach.to_string());
@@ -842,48 +851,63 @@ pub(crate) fn classify_instantiate(err: wasmtime::Error) -> WasmHostError {
 }
 
 /// Reject — *before* instantiation — a component whose statically-declared
-/// table or memory count exceeds the host cap, so a count-cap breach surfaces
-/// as the precise [`WasmHostError::LimitBreached`] instead of the stringly-typed
-/// wasmtime count error (`"resource limit exceeded: {desc} count too high"`,
-/// emitted by `Store::bump_resource_counts`) that [`classify_instantiate`] could
-/// only map to `Link` (issue #82).
+/// table, memory, or component-instance count exceeds the host cap, so a
+/// count-cap breach surfaces as the precise [`WasmHostError::LimitBreached`]
+/// instead of the stringly-typed wasmtime count error
+/// (`"resource limit exceeded: {desc} count too high"`, emitted by
+/// `Store::bump_resource_counts`) that [`classify_instantiate`] could only map
+/// to `Link` (issues #82, #86).
 ///
-/// The counts come from the typed
-/// [`wasmtime::component::Component::resources_required`] summary — *not* an
-/// error-message substring (issue #82 AC2). `table_cap` / `memory_cap` are the
-/// same values wasmtime reads from the store's `RuntimeLimiter`
-/// (`ResourceLimiter::tables` / `memories`), so for a freshly-instantiated store
-/// this check mirrors wasmtime's own boundary exactly — it runs first only to
-/// attach a typed cause, with wasmtime enforcing the identical caps as a
-/// fail-closed backstop. (Were a store reused across instantiations, wasmtime's
-/// counts accumulate while this per-component check does not; an accumulated
-/// breach then still fails closed via wasmtime, surfacing as `Link` — the same
-/// residual as the instance case below.)
+/// Where each count comes from (issue #82 AC2: typed signal, *not* an
+/// error-message substring):
 ///
-/// Which caps actually bind: cadenza configures explicit *count* caps for tables
-/// (`max_tables`) and instances (`max_instances`) only. It bounds memory by
-/// *size* (`max_memory_bytes`, via `RuntimeLimiter::memory_growing`), not by
-/// count, and does not override `ResourceLimiter::memories`, so `memory_cap` here
-/// is wasmtime's built-in default (10_000). The memory branch therefore
-/// classifies a breach of that default count cap — no real plugin approaches it,
-/// but a component declaring an absurd number of memories is then labelled
-/// precisely instead of as `Link`.
+/// - **Tables / memories.** Read from the typed
+///   [`wasmtime::component::Component::resources_required`] summary.
+///   `resources_required` returns `None` when the component imports core
+///   modules or instances (its resource needs are then not statically
+///   knowable); cadenza's own plugins define all core modules statically, so
+///   this returns `Some`. On `None` the table/memory branch is a no-op and
+///   wasmtime stays the sole authority — an over-cap then still surfaces as
+///   `Link`, exactly as before #82.
+/// - **Component instances** (`instance_count`). Pre-counted at load time by
+///   walking the component binary with `wasmparser` (see
+///   [`count_component_core_instances`]). wasmtime 45's `ResourcesRequired`
+///   carries no equivalent field (issue #86, ADR 0009), so the host derives
+///   the count itself; the result is the number `bump_resource_counts` would
+///   compare against, supplied via `LoadedComponent::core_instance_count`.
 ///
-/// `resources_required` returns `None` when the component imports core modules
-/// or instances (its resource needs are then not statically knowable); cadenza's
-/// own plugins define all core modules statically, so this returns `Some`. On
-/// `None` the check is a no-op and wasmtime stays the sole authority — an
-/// over-cap then still surfaces as `Link`, exactly as before #82.
+/// `table_cap` / `memory_cap` / `instance_cap` are the same values wasmtime
+/// reads from the store's `RuntimeLimiter` (`ResourceLimiter::tables` /
+/// `memories` / `instances`), so for a freshly-instantiated store this check
+/// mirrors wasmtime's own boundary exactly — it runs first only to attach a
+/// typed cause, with wasmtime enforcing the identical caps as a fail-closed
+/// backstop. (Were a store reused across instantiations, wasmtime's counts
+/// accumulate while this per-component check does not; an accumulated breach
+/// then still fails closed via wasmtime, surfacing as `Link`.)
 ///
-/// The **instance** count cap is deliberately not checked here: wasmtime 45's
-/// `ResourcesRequired` carries table/memory counts only, with no public
-/// component instance count, so an instance-count breach still classifies as
-/// `Link` (tracked in #86).
+/// Which caps actually bind: cadenza configures explicit *count* caps for
+/// tables (`max_tables`) and instances (`max_instances`) only. It bounds
+/// memory by *size* (`max_memory_bytes`, via `RuntimeLimiter::memory_growing`),
+/// not by count, and does not override `ResourceLimiter::memories`, so
+/// `memory_cap` here is wasmtime's built-in default (10_000). The memory
+/// branch therefore classifies a breach of that default count cap — no real
+/// plugin approaches it, but a component declaring an absurd number of
+/// memories is then labelled precisely instead of as `Link`.
 fn check_declared_resource_counts(
     component: &wasmtime::component::Component,
+    core_instance_count: u32,
     table_cap: usize,
     memory_cap: usize,
+    instance_cap: usize,
 ) -> Result<(), WasmHostError> {
+    // Instance count is derived from a wasmparser walk, independent of
+    // `resources_required` (which may return `None`), so check it first.
+    if core_instance_count as usize > instance_cap {
+        return Err(WasmHostError::LimitBreached(format!(
+            "component declares {core_instance_count} core instances, \
+             exceeding the host cap of {instance_cap}",
+        )));
+    }
     let Some(required) = component.resources_required() else {
         return Ok(());
     };
@@ -900,6 +924,90 @@ fn check_declared_resource_counts(
         )));
     }
     Ok(())
+}
+
+/// Walk a component binary with `wasmparser` and return the number of static
+/// core module instantiations declared anywhere in the component graph. This
+/// is the count wasmtime's `Store::bump_resource_counts` would compare against
+/// the per-store `instances()` cap — derived host-side because wasmtime 45's
+/// public `ResourcesRequired` exposes no equivalent field (issue #86, ADR 0009).
+///
+/// The walk descends into nested core modules and sub-components via the
+/// parser stack `wasmparser` itself surfaces (`Payload::ModuleSection` /
+/// `Payload::ComponentSection` yield a sub-parser plus the byte range to feed
+/// it), so a `CoreInstanceSection` declared inside a nested component still
+/// contributes. For non-recursive component graphs (cadenza's plugins are
+/// flat wit-component output for `wasm32-wasip2`) the resulting total equals
+/// wasmtime's `num_runtime_component_instances` exactly.
+///
+/// **Known limitation.** A `ComponentInstanceSection` entry instantiates a
+/// nested component *once*, and any core instantiations inside that nested
+/// component contribute once to this static count. If a host workflow ever
+/// instantiates the same nested component repeatedly (currently not used by
+/// any cadenza plugin), this pre-check would under-count and wasmtime's own
+/// `bump_resource_counts` would still fire — surfacing as the residual `Link`
+/// branch of [`classify_instantiate`]. That backstop is intentional: the
+/// pre-check exists to *upgrade* the classification of the common case, not
+/// to replace wasmtime's enforcement.
+pub(crate) fn count_component_core_instances(
+    bytes: &[u8],
+) -> Result<u32, wasmparser::BinaryReaderError> {
+    use wasmparser::{Chunk, Instance, Parser, Payload};
+
+    let mut total: u32 = 0;
+    // Stack of outer parsers paused while we drain a nested module/component.
+    // The byte cursor `data` advances across the whole binary regardless of
+    // depth — `Payload::End` pops back to the parent parser, mirroring the
+    // pattern wasmtime/wit-tools use for component traversal.
+    let mut stack: Vec<Parser> = Vec::new();
+    let mut parser = Parser::new(0);
+    let mut data = bytes;
+    loop {
+        let (consumed, payload) = match parser.parse(data, true)? {
+            // `eof: true` above means the parser never returns NeedMoreData;
+            // a malformed truncation surfaces as a BinaryReaderError instead.
+            Chunk::NeedMoreData(_) => unreachable!("eof=true precludes NeedMoreData"),
+            Chunk::Parsed { consumed, payload } => (consumed, payload),
+        };
+        data = &data[consumed..];
+        match payload {
+            // `Payload::InstanceSection` inside a component is the component-
+            // model **core** instance section. Each entry is either an
+            // `Instance::Instantiate { module_index, args }` (a real core
+            // module instantiation that wasmtime's `bump_resource_counts`
+            // would tally against the per-store `instances()` cap) OR an
+            // `Instance::FromExports(...)` (a synthesised export-bag instance
+            // that re-aliases existing items and does NOT bump the count).
+            // Only `Instantiate` entries contribute — `FromExports` would
+            // over-count: a real wit-component output for wasm32-wasip2
+            // emits one `FromExports` per host-import shim, dwarfing the
+            // actual core instantiations. (`ComponentInstanceSection` is a
+            // *different* section for nested component instantiations and
+            // does not feed the core-instance cap either.)
+            Payload::InstanceSection(reader) => {
+                for entry in reader {
+                    if matches!(entry?, Instance::Instantiate { .. }) {
+                        total = total.saturating_add(1);
+                    }
+                }
+            }
+            Payload::ModuleSection {
+                parser: sub_parser, ..
+            }
+            | Payload::ComponentSection {
+                parser: sub_parser, ..
+            } => {
+                stack.push(parser);
+                parser = sub_parser;
+            }
+            Payload::End(_) => match stack.pop() {
+                Some(outer) => parser = outer,
+                None => break,
+            },
+            _ => {}
+        }
+    }
+    Ok(total)
 }
 
 /// Map a `cadenza-workspace` error onto the shared WIT `host-error`. Escapes
@@ -1165,12 +1273,20 @@ mod tests {
         wasmtime::component::Component::new(runtime.engine(), wat).expect("compile wat component")
     }
 
+    /// Encode a `(component ...)` WAT source to its component-binary form so a
+    /// test can drive `count_component_core_instances` directly. The compiled
+    /// wasmtime `Component` does not expose the underlying bytes, so we
+    /// re-encode from text via `wat`.
+    fn wat_component_bytes(wat: &str) -> Vec<u8> {
+        wat::parse_str(wat).expect("encode wat component to bytes")
+    }
+
     // Issue #82: a component declaring more *tables* than the host count cap
     // must be rejected before instantiation with the precise `LimitBreached`,
     // derived from the typed `resources_required()` count — not from a wasmtime
     // error-message substring. The core module declares two tables, so
-    // `num_tables == 2`; a cap of 1 must trip. (Memory cap is left roomy so the
-    // table branch is what fires.)
+    // `num_tables == 2`; a cap of 1 must trip. (Memory and instance caps are
+    // left roomy so the table branch is what fires.)
     #[test]
     fn declared_table_count_over_cap_surfaces_as_limit_breached() {
         let component = wat_component(
@@ -1182,7 +1298,7 @@ mod tests {
               (core instance (instantiate $m)))
         "#,
         );
-        let err = check_declared_resource_counts(&component, 1, usize::MAX)
+        let err = check_declared_resource_counts(&component, 1, 1, usize::MAX, usize::MAX)
             .expect_err("two tables under a cap of one must be rejected");
         assert!(
             matches!(err, WasmHostError::LimitBreached(ref m) if m.contains("tables")),
@@ -1197,7 +1313,7 @@ mod tests {
     // is wasmtime's large built-in default that no real component approaches.
     // Pin that default first (so this test cannot be silently read as proving a
     // tight production cap), then exercise the branch directly with a low cap.
-    // The table cap is left roomy so only the memory branch can fire.
+    // Table and instance caps are left roomy so only the memory branch can fire.
     #[test]
     fn declared_memory_count_over_cap_surfaces_as_limit_breached() {
         let limiter = crate::RuntimeLimiter::new(&crate::WasmRuntimeLimits::default());
@@ -1214,7 +1330,7 @@ mod tests {
               (core instance (instantiate $m)))
         "#,
         );
-        let err = check_declared_resource_counts(&component, usize::MAX, 1)
+        let err = check_declared_resource_counts(&component, 1, usize::MAX, 1, usize::MAX)
             .expect_err("two memories under a cap of one must be rejected");
         assert!(
             matches!(err, WasmHostError::LimitBreached(ref m) if m.contains("memories")),
@@ -1222,8 +1338,32 @@ mod tests {
         );
     }
 
-    // A component within both caps must pass the pre-check untouched, so the
-    // guard cannot false-positive a legitimately-sized component into a denial.
+    // Issue #86: the instance-count branch of the pre-check classifies an
+    // over-count as `LimitBreached` using the wasmparser-derived count, *not*
+    // a wasmtime error-message substring (issue #86 AC2). Cap is 1; the
+    // wasmparser count we hand in is 2, mirroring what a real wasip2 component
+    // with a user module + adapter would declare. Table/memory caps are left
+    // roomy so only the instance branch can fire.
+    #[test]
+    fn declared_instance_count_over_cap_surfaces_as_limit_breached() {
+        let component = wat_component(
+            r#"
+            (component
+              (core module $m (table 1 funcref))
+              (core instance $a (instantiate $m))
+              (core instance $b (instantiate $m)))
+        "#,
+        );
+        let err = check_declared_resource_counts(&component, 2, usize::MAX, usize::MAX, 1)
+            .expect_err("two core instances under a cap of one must be rejected");
+        assert!(
+            matches!(err, WasmHostError::LimitBreached(ref m) if m.contains("instances")),
+            "instance count-cap breach must be LimitBreached, got {err:?}",
+        );
+    }
+
+    // A component within all three caps must pass the pre-check untouched, so
+    // the guard cannot false-positive a legitimately-sized component.
     #[test]
     fn declared_resource_counts_within_caps_pass() {
         let component = wat_component(
@@ -1235,7 +1375,66 @@ mod tests {
               (core instance (instantiate $m)))
         "#,
         );
-        assert!(check_declared_resource_counts(&component, 64, 64).is_ok());
+        assert!(check_declared_resource_counts(&component, 1, 64, 64, 64).is_ok());
+    }
+
+    // Issue #86: the wasmparser walk counts each top-level core instantiation.
+    // Two `(core instance (instantiate $m))` entries → 2.
+    #[test]
+    fn count_component_core_instances_counts_top_level_entries() {
+        let bytes = wat_component_bytes(
+            r#"
+            (component
+              (core module $m (table 1 funcref))
+              (core instance (instantiate $m))
+              (core instance (instantiate $m)))
+        "#,
+        );
+        assert_eq!(count_component_core_instances(&bytes).unwrap(), 2);
+    }
+
+    // Issue #86: the walk descends into nested components so a
+    // `core instance` declared inside a sub-component still contributes —
+    // matching what wasmtime's `bump_resource_counts` would tally. Outer
+    // component owns 1 core instance, inner component owns 1 → total 2.
+    #[test]
+    fn count_component_core_instances_descends_into_nested_components() {
+        let bytes = wat_component_bytes(
+            r#"
+            (component
+              (core module $m (table 1 funcref))
+              (core instance (instantiate $m))
+              (component $inner
+                (core module $m2 (table 1 funcref))
+                (core instance (instantiate $m2))))
+        "#,
+        );
+        assert_eq!(count_component_core_instances(&bytes).unwrap(), 2);
+    }
+
+    // Issue #86: a component with zero `core instance` declarations counts as
+    // zero — proving the walker doesn't over-count by conflating module
+    // definitions with instantiations.
+    #[test]
+    fn count_component_core_instances_zero_when_no_instantiations() {
+        let bytes = wat_component_bytes(
+            r#"
+            (component
+              (core module $m (table 1 funcref)))
+        "#,
+        );
+        assert_eq!(count_component_core_instances(&bytes).unwrap(), 0);
+    }
+
+    // Issue #86: a malformed component surfaces a parser error rather than
+    // silently returning zero — the load path then maps it to `Compile` so the
+    // caller sees a structural rejection, not a phantom "0 instances" pass.
+    #[test]
+    fn count_component_core_instances_rejects_malformed_bytes() {
+        // Valid wasm preamble followed by garbage section bytes.
+        let mut bytes = b"\0asm\x0d\0\x01\0".to_vec();
+        bytes.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        assert!(count_component_core_instances(&bytes).is_err());
     }
 
     // End-to-end proof for issue #75 case 2: a guest that calls an import the

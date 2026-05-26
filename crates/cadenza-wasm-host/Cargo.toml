@@ -17,6 +17,12 @@ tracing.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 wasmtime-wasi-http.workspace = true
+wasmparser.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# WAT → component-binary encoder used by `capabilities` unit tests to drive the
+# wasmparser-based core-instance counter against hand-written components
+# (issue #86). Version matches `wasm-tools` already in the lockfile so no
+# additional copy enters the build.
+wat = "1.250"
