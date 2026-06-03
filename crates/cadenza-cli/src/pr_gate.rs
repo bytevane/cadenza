@@ -368,6 +368,39 @@ mod tests {
         assert!(r.passed(), "{:?}", r.violations);
     }
 
+    // 反作弊:一段等同 PR 模板的空 body 不能满足门禁(否则照抄模板就过)。
+    // 用内联 fixture(不读真模板),与 PR-E 改模板解耦。
+    const TEMPLATE_EMPTY_BODY: &str = "\
+## Linked issue
+Closes #
+## Contract impact
+- [ ] Codex app-server schema or `codex.cli_version`
+- [ ] WIT ABI (`wit/runtime.wit`, `abi/expected/*.wit`)
+- [ ] Pinned dependency versions in `tools/versions.toml`
+";
+
+    #[test]
+    fn empty_template_body_does_not_satisfy_gate() {
+        // 模板的 `Closes #` 无数字 → 不算一个 closing ref → 规则1 fail
+        let r = evaluate(&[cf("wit/runtime.wit")], TEMPLATE_EMPTY_BODY);
+        assert!(!r.passed());
+        assert!(r.violations.iter().any(|m| m.contains("Closes")));
+    }
+
+    // git mv 一个已有文件进敏感目录也算命中(分类只看路径,改名后的新路径命中)
+    #[test]
+    fn git_mv_into_wit_is_classified() {
+        let r = evaluate(&[cf("wit/moved.wit")], "Closes #1");
+        assert!(r.violations.iter().any(|m| m.contains("WIT ABI")));
+    }
+
+    // `Closes #` 占位符(无数字)不计数
+    #[test]
+    fn placeholder_closes_without_digit_is_zero() {
+        let r = evaluate(&[cf("README.md")], "Closes #\nsummary");
+        assert!(r.violations.iter().any(|m| m.contains("found 0")));
+    }
+
     // 测试辅助:构造一个无版本键变化的 ChangedFile
     fn cf(path: &str) -> ChangedFile {
         ChangedFile {
