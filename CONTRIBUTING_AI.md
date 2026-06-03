@@ -48,6 +48,40 @@ When you ask an AI tool for a patch, restrict it to the files relevant
 to the issue and surface the constraint in the prompt (e.g. "modify
 only `crates/cadenza-codex/` and `crates/cadenza-codex/tests/`").
 
+## Anti-over-design principles
+
+Earned by the aiops-platform port (a sibling Symphony runtime), which spent a
+dozen `remove/drop` PRs unwinding gates, caps, and config the AI added that the
+contract never asked for. These principles exist to keep cadenza from repeating
+that rework.
+
+- **Contract absence is an over-design signal.** Before adding any
+  orchestrator/host-side stage, gate, artifact, or config that acts on agent
+  output, confirm the behaviour is actually permitted there by `wit/runtime.wit`,
+  the generated Codex schema, or SPEC. If the contract has no equivalent, that is
+  a strong signal the component is over-design, not a feature gap to fill.
+  **Delete it — do not relocate it (move-to-prompt) or merely document it (a
+  `DEVIATIONS.md` row).** Relocating or documenting preserves scaffolding that no
+  longer earns its place.
+
+- **Research to a verdict before proposing; bring the verdict, not a menu.** When
+  SPEC + WIT + reference research settles whether a component belongs, decide and
+  act on it. Do not hand a keep / relocate / document multiple-choice back to the
+  reviewer — that menu is usually a symptom that the research which would rule out
+  "keep" was not finished. Reserve genuine choices for scope, intent, or safety
+  forks the contract leaves open.
+
+- **Unbounded semantics get no caps.** The orchestrator state machine (`claimed`
+  / `running` / `retry_attempts`) gets no new terminal state, retry cap, or
+  continuation cap unless SPEC gives a give-up branch. Adding any cap requires an
+  ADR citing the contract basis. SPEC retries are unbounded with backoff; do not
+  "make it safer" by inventing a ceiling.
+
+- **Earn your rules.** A new discipline rule should trace to a specific observed
+  failure. Annotate it `Earned by: #PR (symptom)` so it can be audited and
+  removed when a future model no longer needs it. When in doubt, leave a rule out
+  until a failure demands it.
+
 ## Branch naming
 
 | Branch prefix      | Use when …                                                  |
