@@ -67,3 +67,4 @@ The host imports `host-log`, `host-time`, `host-workspace`, `host-http`, `host-s
 - A patch that touches Codex schema, WIT ABI, secret handling, workspace path safety, orchestrator state semantics, or observability field names **requires an ADR** under `decisions/`.
 - Use `prompts/codex-runtime.md` for protocol/app-server work and `prompts/claude-dev.md` for general implementation. Never invent protocol fields not present in the generated schemas or WIT functions not present in `wit/runtime.wit`.
 - Do not skip tests via `#[ignore]`, `--no-verify`, or `if false`. New behaviour ships with a failing-first test (TDD).
+- Anti-over-design rules (delete don't relocate; research to a verdict, not a menu; no caps on unbounded semantics; earn your rules) live in `CONTRIBUTING_AI.md` → "Anti-over-design principles". Don't duplicate them here.
