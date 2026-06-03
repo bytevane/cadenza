@@ -1,3 +1,5 @@
+mod pr_gate;
+
 use std::fs;
 use std::path::PathBuf;
 

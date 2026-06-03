@@ -17,6 +17,7 @@ cadenza-workflow = { path = "../cadenza-workflow" }
 cadenza-workspace = { path = "../cadenza-workspace" }
 camino.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 serde_yaml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -27,6 +28,5 @@ cadenza-codex = { path = "../cadenza-codex" }
 cadenza-obs = { path = "../cadenza-obs" }
 cadenza-orchestrator = { path = "../cadenza-orchestrator" }
 cadenza-tracker-linear = { path = "../cadenza-tracker-linear" }
-serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
