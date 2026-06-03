@@ -3,6 +3,42 @@
 //! deviations shipped because checks were audit-time judgement, not author-time
 //! mechanics. See CONTRIBUTING_AI.md "Anti-over-design principles".
 
+use cadenza_core::contracts::MVP_CRITICAL_KEYS;
+
+/// MVP-critical keys whose assigned value differs between `base` and `head`
+/// versions of `tools/versions.toml`. Comment/format-only edits don't count.
+pub fn changed_version_keys(base: &str, head: &str) -> Vec<String> {
+    MVP_CRITICAL_KEYS
+        .iter()
+        .filter(|k| assigned_value(base, k) != assigned_value(head, k))
+        .map(|k| (*k).to_string())
+        .collect()
+}
+
+/// Value side of `key = <value>` with any inline `#` comment stripped, trimmed.
+/// Mirrors the parsing style of cadenza-core's contract registry (text-only).
+fn assigned_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    for raw in body.lines() {
+        let line = raw.trim_start();
+        if let Some(rest) = line.strip_prefix(key) {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                // strip an inline comment that is outside of quotes (simple form:
+                // versions.toml values are quoted, so a `#` after the closing
+                // quote terminates the value).
+                let val = val.trim();
+                let cut = if let Some(stripped) = val.strip_prefix('"') {
+                    stripped.find('"').map(|e| &val[..e + 2]).unwrap_or(val)
+                } else {
+                    val.split('#').next().unwrap_or(val).trim()
+                };
+                return Some(cut.trim());
+            }
+        }
+    }
+    None
+}
+
 /// A file changed in the PR, with just enough info to classify contract impact.
 #[derive(Debug, Clone)]
 pub struct ChangedFile {
@@ -32,7 +68,6 @@ enum Area {
     WitAbi,
     PinnedVersions,
     GateSelf,
-    Secret,
     Observability,
     WorkspaceSafety,
     OrchestratorState,
@@ -55,7 +90,6 @@ impl Area {
             Area::WitAbi => "WIT ABI",
             Area::PinnedVersions => "Pinned dependency versions",
             Area::GateSelf => "WIT ABI", // gate-self change is infra; reuse no box — see note
-            Area::Secret => "Secret handling",
             Area::Observability => "Observability field names",
             Area::WorkspaceSafety => "Workspace path safety",
             Area::OrchestratorState => "Orchestrator state machine",
@@ -68,7 +102,6 @@ impl Area {
             Area::WitAbi => "WIT ABI",
             Area::PinnedVersions => "pinned versions (tools/versions.toml)",
             Area::GateSelf => "the PR gate itself",
-            Area::Secret => "secret/redaction/log-field surface",
             Area::Observability => "observability field names",
             Area::WorkspaceSafety => "workspace path safety",
             Area::OrchestratorState => "orchestrator state machine",
@@ -78,7 +111,6 @@ impl Area {
     /// Token used in the `no <token> semantics change` declaration for soft areas.
     fn declaration_token(self) -> &'static str {
         match self {
-            Area::Secret => "secret",
             Area::Observability => "observability",
             Area::WorkspaceSafety => "workspace",
             Area::OrchestratorState => "orchestrator",
@@ -399,6 +431,21 @@ Closes #
     fn placeholder_closes_without_digit_is_zero() {
         let r = evaluate(&[cf("README.md")], "Closes #\nsummary");
         assert!(r.violations.iter().any(|m| m.contains("found 0")));
+    }
+
+    #[test]
+    fn changed_version_keys_detects_value_change_only() {
+        let base = "cli_version = \"rust-v0.133.0\"\ntoolchain_version = \"1.95.0\"\n";
+        let head = "cli_version = \"rust-v0.134.0\"\ntoolchain_version = \"1.95.0\"\n";
+        let keys = changed_version_keys(base, head);
+        assert_eq!(keys, vec!["cli_version".to_string()]);
+    }
+
+    #[test]
+    fn changed_version_keys_ignores_comment_only_edit() {
+        let base = "cli_version = \"rust-v0.133.0\"\n";
+        let head = "cli_version = \"rust-v0.133.0\" # bump soon\n";
+        assert!(changed_version_keys(base, head).is_empty());
     }
 
     // 测试辅助:构造一个无版本键变化的 ChangedFile
