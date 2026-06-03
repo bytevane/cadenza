@@ -13,10 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Read pinned Rust toolchain from ledger
+        run: |
+          set -euo pipefail
+          v=$(awk -F'"' '/^toolchain_version[[:space:]]*=/{print $2; exit}' tools/versions.toml)
+          [ -n "$v" ] || { echo "toolchain_version missing in tools/versions.toml" >&2; exit 1; }
+          echo "RUST_TOOLCHAIN=$v" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
         with:
-          # Toolchain pinned by tools/versions.toml and rust-toolchain.toml.
-          toolchain: "1.95.0"
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
           targets: wasm32-wasip2
       - uses: Swatinem/rust-cache@v2
