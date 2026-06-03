@@ -88,6 +88,29 @@ pub fn pending_mvp_critical_keys(body: &str) -> Vec<String> {
     offenders
 }
 
+/// Return the unquoted, comment-stripped value assigned to `key` in `body`, if any.
+/// Reuses the registry's text-only parsing (no TOML crate). Used by drift checks.
+pub fn assigned_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    for raw in body.lines() {
+        let line = raw.trim_start();
+        if line_assigns_key(line, key) {
+            let value = strip_inline_comment(line);
+            let after_eq = value.split_once('=')?.1.trim();
+            let unquoted = after_eq
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| {
+                    after_eq
+                        .strip_prefix('\'')
+                        .and_then(|s| s.strip_suffix('\''))
+                })
+                .unwrap_or(after_eq);
+            return Some(unquoted);
+        }
+    }
+    None
+}
+
 /// Return MVP-critical keys that are not assigned anywhere in `body`.
 pub fn missing_mvp_critical_keys(body: &str) -> Vec<&'static str> {
     MVP_CRITICAL_KEYS
@@ -256,5 +279,32 @@ wasmtime_version = "45.0.0""#,
             missing.is_empty(),
             "tools/versions.toml is missing MVP-critical keys: {missing:?}",
         );
+    }
+
+    #[test]
+    fn toolchain_channel_matches_pinned_version() {
+        let versions = include_str!("../../../tools/versions.toml");
+        let toolchain = include_str!("../../../rust-toolchain.toml");
+        let pinned = assigned_value(versions, "toolchain_version")
+            .expect("toolchain_version pinned in versions.toml");
+        let channel =
+            assigned_value(toolchain, "channel").expect("channel set in rust-toolchain.toml");
+        assert_eq!(
+            pinned, channel,
+            "rust-toolchain.toml channel ({channel}) must match versions.toml toolchain_version ({pinned})"
+        );
+    }
+
+    #[test]
+    fn assigned_value_strips_quotes_and_comments() {
+        assert_eq!(
+            assigned_value("channel = \"1.95.0\"\n", "channel"),
+            Some("1.95.0")
+        );
+        assert_eq!(
+            assigned_value("channel = \"1.95.0\" # note\n", "channel"),
+            Some("1.95.0")
+        );
+        assert_eq!(assigned_value("other = \"x\"\n", "channel"), None);
     }
 }
