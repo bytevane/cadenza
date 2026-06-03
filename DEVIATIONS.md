@@ -3,7 +3,7 @@
 The gap/progress half of cadenza's governance, paired with `decisions/` (which
 records direction). Every confirmed or accepted divergence from a frozen contract
 (SPEC.md, `wit/runtime.wit`, the generated Codex schema, `tools/versions.toml`)
-gets one row here. See `decisions/0009-deviation-ledger.md` for why this exists,
+gets one row here. See `decisions/0010-deviation-ledger.md` for why this exists,
 and `CONTRIBUTING_AI.md` → "Anti-over-design principles" for what counts as a
 deviation.
 
@@ -40,7 +40,7 @@ Prefer locally verifiable anchors, in this order:
 
 | ID | Area | Contract reference | Severity | Status | Tracking |
 |----|------|--------------------|----------|--------|----------|
-| _none yet_ | | | | | |
+| D1 | Orchestrator enforces a retry cap + give-up: `LifecyclePolicy::max_retries` (default 5) → `LifecycleDecision::GiveUp` (`crates/cadenza-orchestrator/src/lifecycle.rs`). Symphony SPEC.md retries are unbounded with backoff (no give-up branch); intentional per #19 but not yet ADR'd or SPEC-reconciled. | `crates/cadenza-orchestrator/src/lifecycle.rs` `LifecyclePolicy::max_retries` vs SPEC.md retry semantics | High | Open | #19 |
 
 <!--
 Row template (copy, fill, assign the next unused D-number):

@@ -132,8 +132,8 @@ reasonable value within `poll.interval_ms * 2` after boot.
 - The compatibility gates assume the operator stopped the process
   cleanly. A hard kill (`-SIGKILL`) may leave a half-written log file;
   no harm to workspaces.
-- See `decisions/0009-orchestrator-state-and-recovery.md` for the
-  detailed design rationale.
+- See `DEVIATIONS.md` (D1) and #19 for the lifecycle-policy design rationale
+  (the originally-referenced ADR was never written).
 
 ## What to do AFTER rollback
 
