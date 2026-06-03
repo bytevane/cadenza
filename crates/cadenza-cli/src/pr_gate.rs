@@ -17,6 +17,11 @@ pub fn changed_version_keys(base: &str, head: &str) -> Vec<String> {
 
 /// Value side of `key = <value>` with any inline `#` comment stripped, trimmed.
 /// Mirrors the parsing style of cadenza-core's contract registry (text-only).
+///
+/// Assumes double-quoted values (the `tools/versions.toml` format): a `#` after
+/// the closing quote terminates the value. A `#` inside a single-quoted literal
+/// is not treated comment-aware here — cadenza-core's `strip_inline_comment` is
+/// the full implementation.
 fn assigned_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     for raw in body.lines() {
         let line = raw.trim_start();
@@ -90,7 +95,7 @@ impl Area {
             Area::CodexSchema => "Codex app-server schema",
             Area::WitAbi => "WIT ABI",
             Area::PinnedVersions => "Pinned dependency versions",
-            Area::GateSelf => "WIT ABI", // gate-self change is infra; reuse no box — see note
+            Area::GateSelf => "", // no PR box; gate-self is ADR-only
             Area::Observability => "Observability field names",
             Area::WorkspaceSafety => "Workspace path safety",
             Area::OrchestratorState => "Orchestrator state machine",
@@ -196,16 +201,25 @@ fn declares_no_change(body: &str, token: &str) -> bool {
 }
 
 /// Count `Closes #<n>` closing references (case-insensitive keyword, digits).
+/// A left word boundary is required so substrings like `Encloses #1` or
+/// `discloses #2` are not miscounted as closing references.
 fn count_closes(body: &str) -> usize {
     let lower = body.to_lowercase();
     let mut n = 0;
-    let mut rest = lower.as_str();
-    while let Some(i) = rest.find("closes #") {
-        let after = &rest[i + "closes #".len()..];
-        if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("closes #") {
+        let i = search_from + rel;
+        // left word boundary: the char before "closes" must be a non-letter
+        // (or "closes" must be at the very start of the body).
+        let left_ok = lower[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphabetic());
+        let after = &lower[i + "closes #".len()..];
+        if left_ok && after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             n += 1;
         }
-        rest = &rest[i + "closes #".len()..];
+        search_from = i + "closes #".len();
     }
     n
 }
@@ -288,6 +302,13 @@ mod tests {
         let r = evaluate(&[cf("README.md")], "Closes #1 and also Closes #2");
         assert!(!r.passed());
         assert!(r.violations.iter().any(|m| m.contains("exactly one")));
+    }
+
+    // `Encloses #1` 是子串误匹配,不应计为 closing reference;只数真正的 `Closes #5`
+    #[test]
+    fn encloses_is_not_a_closing_reference() {
+        let r = evaluate(&[cf("README.md")], "Encloses #1 in the box\nCloses #5");
+        assert!(r.passed(), "{:?}", r.violations);
     }
 
     // 改了 wit/ 但没勾 WIT ABI box → fail
