@@ -3,7 +3,7 @@
 The gap/progress half of cadenza's governance, paired with `decisions/` (which
 records direction). Every confirmed or accepted divergence from a frozen contract
 (SPEC.md, `wit/runtime.wit`, the generated Codex schema, `tools/versions.toml`)
-gets one row here. See `decisions/0009-deviation-ledger.md` for why this exists,
+gets one row here. See `decisions/0010-deviation-ledger.md` for why this exists,
 and `CONTRIBUTING_AI.md` → "Anti-over-design principles" for what counts as a
 deviation.
 

@@ -1,4 +1,4 @@
-# ADR 0009: Deviation ledger for frozen-contract gaps
+# ADR 0010: Deviation ledger for frozen-contract gaps
 
 ## Status
 
