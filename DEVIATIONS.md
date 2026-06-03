@@ -44,5 +44,5 @@ Prefer locally verifiable anchors, in this order:
 
 <!--
 Row template (copy, fill, assign the next unused D-number):
-| D1 | <what deviates + short fix narrative> | <wit sig / schema field / SPEC.md §> | P0|P1|High|Medium|Low | Open|Reverting|Reverted|Closed|Closed (accepted deviation) | #issue / #pr |
+| D1 | <what deviates + short fix narrative> | <wit sig / schema field / SPEC.md §> | P0 / P1 / High / Medium / Low | Open / Reverting / Reverted / Closed / Closed (accepted deviation) | #issue / #pr |
 -->
