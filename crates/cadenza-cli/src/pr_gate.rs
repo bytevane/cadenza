@@ -272,11 +272,14 @@ fn count_closes(body: &str) -> usize {
 pub fn evaluate(changed: &[ChangedFile], pr_body: &str) -> GateResult {
     let mut violations = Vec::new();
 
-    // Rule 1: exactly one closing reference (one PR = one issue).
+    // Rule 1: at most one closing reference. cadenza branch-naming
+    // (CONTRIBUTING_AI.md) allows issue-less docs/feat/fix/infra/chore PRs, so the
+    // gate must not force an issue link — it only rejects stuffing multiple issues
+    // into one PR (one PR = one issue).
     let closes = count_closes(pr_body);
-    if closes != 1 {
+    if closes > 1 {
         violations.push(format!(
-            "PR body must contain exactly one `Closes #<n>` (found {closes})"
+            "PR body must contain at most one `Closes #<n>` (found {closes}); cadenza branch-naming allows issue-less docs/feat/fix/infra/chore PRs"
         ));
     }
 
@@ -466,18 +469,18 @@ mod tests {
         assert!(r.passed(), "{:?}", r.violations);
     }
 
+    // 无 Closes(0 个)在 issue-less docs/feat/fix/infra/chore PR 中是合法的
     #[test]
-    fn missing_closes_fails() {
+    fn missing_closes_is_allowed() {
         let r = evaluate(&[cf("README.md")], "no issue link here");
-        assert!(!r.passed());
-        assert!(r.violations.iter().any(|m| m.contains("Closes")));
+        assert!(r.passed(), "{:?}", r.violations);
     }
 
     #[test]
     fn two_closes_fails() {
         let r = evaluate(&[cf("README.md")], "Closes #1 and also Closes #2");
         assert!(!r.passed());
-        assert!(r.violations.iter().any(|m| m.contains("exactly one")));
+        assert!(r.violations.iter().any(|m| m.contains("at most one")));
     }
 
     // `Encloses #1` 是子串误匹配,不应计为 closing reference;只数真正的 `Closes #5`
@@ -804,10 +807,37 @@ Closes #
 
     #[test]
     fn empty_template_body_does_not_satisfy_gate() {
-        // 模板的 `Closes #` 无数字 → 不算一个 closing ref → 规则1 fail
+        // 照抄空模板(WIT ABI box 是 `- [ ]` 未勾、无 ADR)改了 wit/ 仍不能过门禁:
+        // 0-closes 已不再是 violation,反作弊改由硬路径未勾 box 把守。
         let r = evaluate(&[cf("wit/runtime.wit")], TEMPLATE_EMPTY_BODY);
         assert!(!r.passed());
-        assert!(r.violations.iter().any(|m| m.contains("Closes")));
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("WIT ABI") && m.contains("unchecked")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // 回归(#96):门禁要能放过它自己的无-issue 治理 PR。
+    // #96 改了 pr_gate.rs + pr-metadata.yml(GateSelf 硬路径),body 无 Closes,
+    // 并带 decisions/0011-*.md(ADR)。GateSelf 硬路径只要求 ADR(无 PR box),
+    // 0-closes 在 at-most-one 规则下合法 → 整体 pass。
+    #[test]
+    fn gate_passes_on_its_own_issueless_pr() {
+        let changed = [
+            cf(".github/workflows/pr-metadata.yml"),
+            cf("crates/cadenza-cli/src/pr_gate.rs"),
+            ChangedFile {
+                path: "decisions/0011-author-time-pr-gate.md".to_string(),
+                status: ChangeStatus::Added,
+                changed_version_keys: Vec::new(),
+                added_deviation_row: false,
+            },
+        ];
+        let r = evaluate(&changed, "n/a feat branch, depends on #94");
+        assert!(r.passed(), "{:?}", r.violations);
     }
 
     // git mv 一个已有文件进敏感目录也算命中(分类只看路径,改名后的新路径命中)
@@ -817,11 +847,13 @@ Closes #
         assert!(r.violations.iter().any(|m| m.contains("WIT ABI")));
     }
 
-    // `Closes #` 占位符(无数字)不计数
+    // `Closes #` 占位符(无数字)计为 0 个有效 closing ref;0 个在无敏感路径的
+    // PR 上是合法的(规则1 = at most one),所以 evaluate 通过。
     #[test]
     fn placeholder_closes_without_digit_is_zero() {
+        assert_eq!(count_closes("Closes #\nsummary"), 0);
         let r = evaluate(&[cf("README.md")], "Closes #\nsummary");
-        assert!(r.violations.iter().any(|m| m.contains("found 0")));
+        assert!(r.passed(), "{:?}", r.violations);
     }
 
     #[test]
