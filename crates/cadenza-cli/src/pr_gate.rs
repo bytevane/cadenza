@@ -71,6 +71,7 @@ enum Area {
     Observability,
     WorkspaceSafety,
     OrchestratorState,
+    Secret,
 }
 
 impl Area {
@@ -93,6 +94,7 @@ impl Area {
             Area::Observability => "Observability field names",
             Area::WorkspaceSafety => "Workspace path safety",
             Area::OrchestratorState => "Orchestrator state machine",
+            Area::Secret => "Secret handling",
         }
     }
 
@@ -105,6 +107,7 @@ impl Area {
             Area::Observability => "observability field names",
             Area::WorkspaceSafety => "workspace path safety",
             Area::OrchestratorState => "orchestrator state machine",
+            Area::Secret => "secret/redaction/log-field surface",
         }
     }
 
@@ -114,6 +117,7 @@ impl Area {
             Area::Observability => "observability",
             Area::WorkspaceSafety => "workspace",
             Area::OrchestratorState => "orchestrator",
+            Area::Secret => "secret",
             _ => "", // hard areas don't use declarations
         }
     }
@@ -162,6 +166,9 @@ fn classify(changed: &[ChangedFile]) -> Vec<Area> {
         }
         if p.starts_with("crates/cadenza-obs/") {
             push(Area::Observability);
+        }
+        if p.starts_with("crates/cadenza-host-linear-http/") {
+            push(Area::Secret);
         }
     }
     areas
@@ -398,6 +405,30 @@ mod tests {
     fn soft_path_with_no_semantics_declaration_passes() {
         let body = "Closes #1\n\nno orchestrator semantics change";
         let r = evaluate(&[cf("crates/cadenza-orchestrator/src/state.rs")], body);
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // 改 host-linear-http(软,secret 注入边界)无任何声明 → fail，提示 secret + declare
+    #[test]
+    fn soft_secret_path_without_declaration_fails() {
+        let r = evaluate(
+            &[cf("crates/cadenza-host-linear-http/src/lib.rs")],
+            "Closes #1",
+        );
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("secret") && m.contains("declare")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // 改 host-linear-http + 写 `no secret semantics change` → pass
+    #[test]
+    fn soft_secret_path_with_no_semantics_declaration_passes() {
+        let body = "Closes #1\n\nno secret semantics change";
+        let r = evaluate(&[cf("crates/cadenza-host-linear-http/src/lib.rs")], body);
         assert!(r.passed(), "{:?}", r.violations);
     }
 
