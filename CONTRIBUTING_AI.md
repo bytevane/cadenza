@@ -71,10 +71,12 @@ that rework.
   "keep" was not finished. Reserve genuine choices for scope, intent, or safety
   forks the contract leaves open.
 
-- **Unbounded semantics get no caps.** The orchestrator state machine (`claimed`
-  / `running` / `retry_attempts`) gets no new terminal state, retry cap, or
-  continuation cap unless SPEC.md gives a give-up branch. Adding any cap requires an
-  ADR citing the contract basis. SPEC.md retries are unbounded with backoff; do not
+- **Unbounded semantics: no *new* caps without an ADR.** Symphony SPEC.md retries
+  are unbounded with backoff (no give-up branch). The orchestrator's existing
+  lifecycle policy (`max_retries`/`GiveUp`, #19) already diverges from that — it is
+  tracked as a deviation (`DEVIATIONS.md` D1) pending a SPEC ruling, not a
+  precedent to extend. Do not add further terminal states, retry caps, or
+  continuation caps; any new cap requires an ADR citing the contract basis. Don't
   "make it safer" by inventing a ceiling.
 
 - **Earn your rules.** A new discipline rule should trace to a specific observed

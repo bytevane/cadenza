@@ -40,7 +40,7 @@ Prefer locally verifiable anchors, in this order:
 
 | ID | Area | Contract reference | Severity | Status | Tracking |
 |----|------|--------------------|----------|--------|----------|
-| _none yet_ | | | | | |
+| D1 | Orchestrator enforces a retry cap + give-up: `LifecyclePolicy::max_retries` (default 5) → `LifecycleDecision::GiveUp` (`crates/cadenza-orchestrator/src/lifecycle.rs`). Symphony SPEC.md retries are unbounded with backoff (no give-up branch); intentional per #19 but not yet ADR'd or SPEC-reconciled. | `crates/cadenza-orchestrator/src/lifecycle.rs` `LifecyclePolicy::max_retries` vs SPEC.md retry semantics | High | Open | #19 |
 
 <!--
 Row template (copy, fill, assign the next unused D-number):
