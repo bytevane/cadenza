@@ -44,6 +44,12 @@ speed-bumps.
 - A change to a hard contract path cannot merge while claiming "no impact".
 - The `pr-gate` job must be made a required status check by a repo admin (use the
   exact job name `pr-gate`); see the spec's deployment prerequisites.
-- The gate's own code is a hard path, so weakening it requires an ADR.
+- The gate's own code is a hard path, so weakening it requires an ADR. This hard
+  path includes `crates/cadenza-cli/src/main.rs`, because its `Command::PrGate`
+  arm is the only caller of `pr_gate::run` — neutering that arm would silently
+  skip the gate with CI still green. The trade-off is a slight over-reach: editing
+  any other `cadenza-cli` subcommand (e.g. `doctor`) now also requires an ADR. We
+  accept it because `cadenza-cli` is a small, low-churn operator entrypoint, and
+  blocking a silent gate-skip outranks avoiding that over-reach.
 - If the repo later accepts fork PRs or enables a merge queue, the trigger model
   must be revisited (`merge_group`).

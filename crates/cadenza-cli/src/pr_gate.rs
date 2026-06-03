@@ -175,8 +175,16 @@ fn classify(changed: &[ChangedFile]) -> Vec<Area> {
                 push(Area::PinnedVersions);
             }
         }
+        // GateSelf also covers main.rs: its `Command::PrGate` arm is the *only*
+        // caller of `pr_gate::run`, so neutering that arm (e.g. `=> Ok(())`) would
+        // make `cadenza pr-gate` "succeed" while silently skipping the gate, with
+        // CI still green and no backstop. Trade-off: editing *any* cadenza-cli
+        // subcommand (doctor, etc.) now also needs an ADR — a slight over-reach,
+        // but cli is a small operator entrypoint with low churn, and blocking a
+        // silent gate-skip outranks avoiding over-reach (see ADR 0011 Consequences).
         if p == ".github/workflows/pr-metadata.yml"
             || p.starts_with("crates/cadenza-cli/src/pr_gate")
+            || p == "crates/cadenza-cli/src/main.rs"
         {
             push(Area::GateSelf);
         }
@@ -193,20 +201,68 @@ fn classify(changed: &[ChangedFile]) -> Vec<Area> {
         if p.starts_with("crates/cadenza-host-linear-http/") {
             push(Area::Secret);
         }
+        // cadenza-codex's launcher.rs owns secret collection (`with_secrets`) and
+        // stderr redaction (`redact_text`); changing its redaction behaviour alters
+        // a secret-handling surface. Scoped to this one file (not the whole codex
+        // protocol crate) to avoid treating all of codex as a secret gate.
+        if p == "crates/cadenza-codex/src/launcher.rs" {
+            push(Area::Secret);
+        }
         // cadenza-wasm-host wires the host-log / host-workspace / host-secrets
         // capabilities (capabilities.rs); changes there can alter guest-visible
-        // logging/redaction/workspace/secret behaviour. Its most sensitive surface
-        // is host-secrets, so it falls under the Secret soft gate.
+        // logging/redaction (observability), workspace containment, or secret
+        // behaviour. It must map to *all three* soft areas it actually implements —
+        // otherwise editing workspace-containment or log/audit fields could slip
+        // past under a lone `no secret semantics change` declaration. A hit here
+        // requires checking the matching box (or a `no <area> semantics change`
+        // declaration) for each of secret, workspace, and observability.
         if p.starts_with("crates/cadenza-wasm-host/") {
             push(Area::Secret);
+            push(Area::WorkspaceSafety);
+            push(Area::Observability);
         }
     }
     areas
 }
 
-/// True if the PR body checks the box whose text contains `marker`.
+/// Slice of `body` that is the `## Contract impact` section: from the heading line
+/// containing "Contract impact" up to (but not including) the next `## ` heading, or
+/// to end-of-body. Returns `""` if no such section exists. Scoping box detection to
+/// this section stops unrelated checklists (e.g. the Reviewer checklist's "Pinned
+/// dependency versions ... were not edited inline by the tool") from accidentally
+/// satisfying a Contract-impact box that shares a marker substring.
+fn contract_impact_section(body: &str) -> &str {
+    let mut lines = body.lines();
+    let mut offset = 0usize;
+    // Find the heading line that opens the Contract-impact section.
+    let start = loop {
+        let Some(line) = lines.next() else {
+            return "";
+        };
+        let after = offset + line.len() + 1; // +1 for the consumed '\n'
+        let t = line.trim_start();
+        if t.starts_with("##") && t.contains("Contract impact") {
+            break after.min(body.len());
+        }
+        offset = after;
+    };
+    // Walk forward to the next `## ` heading (the section end).
+    let mut scan = start;
+    for line in body[start..].lines() {
+        let t = line.trim_start();
+        if t.starts_with("## ") {
+            return &body[start..scan];
+        }
+        scan = (scan + line.len() + 1).min(body.len());
+    }
+    &body[start..]
+}
+
+/// True if the PR body's `## Contract impact` section checks the box whose text
+/// contains `marker`. Restricting to that section avoids matching look-alike
+/// checklist lines elsewhere in the body.
 fn box_checked(body: &str, marker: &str) -> bool {
-    body.lines().any(|l| {
+    contract_impact_section(body).lines().any(|l| {
         let t = l.trim_start();
         (t.starts_with("- [x]") || t.starts_with("- [X]")) && t.contains(marker)
     })
@@ -449,12 +505,42 @@ fn parse_name_status_line(line: &str) -> Option<(ChangeStatus, String)> {
 }
 
 /// True if a unified `git diff` of `DEVIATIONS.md` *adds* at least one real ledger
-/// row (an added line, `+`-prefixed but not the `+++` file header, whose content is
-/// a `| D<n> |` row).
+/// row: an added line (`+`-prefixed, not the `+++` file header) that is a `| D<n> |`
+/// row AND is *not* inside an HTML comment block.
+///
+/// DEVIATIONS.md ships a `<!-- Row template ... | D1 | <what deviates...> | ... -->`
+/// example inside a comment. Without comment-awareness, adding a D-row-shaped line
+/// inside that comment would falsely unlock the accepted-deviation escape hatch.
+/// We track an `in_comment` state across the diff's *added* lines (added lines are
+/// all we can see), entering on a `<!--` and leaving on a `-->`, and only count
+/// D-rows seen while outside a comment. A `<!--` / `-->` on the same line toggles
+/// twice (net no change), so a self-contained one-line comment is handled too.
 fn diff_adds_deviation_row(diff: &str) -> bool {
-    diff.lines().any(|l| {
-        l.starts_with('+') && !l.starts_with("+++") && is_deviation_row(l.trim_start_matches('+'))
-    })
+    let mut in_comment = false;
+    for l in diff.lines() {
+        if !l.starts_with('+') || l.starts_with("+++") {
+            continue;
+        }
+        let content = l.trim_start_matches('+');
+        // Whether this added line *starts* inside a comment (before we apply this
+        // line's own toggles) decides if a D-row on it counts.
+        let was_in_comment = in_comment;
+        // Apply comment open/close markers left-to-right within this line.
+        let mut rest = content;
+        while let Some(idx) = rest.find(if in_comment { "-->" } else { "<!--" }) {
+            in_comment = !in_comment;
+            let marker_len = if in_comment {
+                "<!--".len()
+            } else {
+                "-->".len()
+            };
+            rest = &rest[idx + marker_len..];
+        }
+        if !was_in_comment && !in_comment && is_deviation_row(content) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -505,7 +591,7 @@ mod tests {
     #[test]
     fn wit_change_with_box_and_adr_passes_box_rule() {
         let changed = [cf("wit/runtime.wit"), cf("decisions/0011-foo.md")];
-        let body = "Closes #1\n- [x] WIT ABI (`wit/runtime.wit`, `abi/expected/*.wit`)";
+        let body = "Closes #1\n## Contract impact\n- [x] WIT ABI (`wit/runtime.wit`, `abi/expected/*.wit`)";
         let r = evaluate(&changed, body);
         assert!(
             !r.violations.iter().any(|m| m.contains("unchecked")),
@@ -571,7 +657,7 @@ mod tests {
     #[test]
     fn hard_path_with_box_and_adr_passes() {
         let changed = [cf("wit/runtime.wit"), cf("decisions/0011-x.md")];
-        let body = "Closes #1\n- [x] WIT ABI";
+        let body = "Closes #1\n## Contract impact\n- [x] WIT ABI";
         let r = evaluate(&changed, body);
         assert!(r.passed(), "{:?}", r.violations);
     }
@@ -637,10 +723,10 @@ mod tests {
     }
 
     // 改 workspace + 勾 box → pass(声明了影响)；注意软路径勾 box 也要按规则3配 ADR? 否：软路径不强制 ADR
-    // Fix 5: 软路径勾 box(声明有 contract 影响)但无 ADR → fail
+    // 软路径勾 box(声明有 contract 影响)但无 ADR → fail
     #[test]
     fn soft_path_with_box_but_no_adr_fails() {
-        let body = "Closes #1\n- [x] Workspace path safety / containment rules";
+        let body = "Closes #1\n## Contract impact\n- [x] Workspace path safety / containment rules";
         let r = evaluate(&[cf("crates/cadenza-workspace/src/lib.rs")], body);
         assert!(
             r.violations
@@ -651,10 +737,10 @@ mod tests {
         );
     }
 
-    // Fix 5: 软路径勾 box + ADR → pass
+    // 软路径勾 box + ADR → pass
     #[test]
     fn soft_path_with_box_and_adr_passes() {
-        let body = "Closes #1\n- [x] Workspace path safety / containment rules";
+        let body = "Closes #1\n## Contract impact\n- [x] Workspace path safety / containment rules";
         let changed = [
             cf("crates/cadenza-workspace/src/lib.rs"),
             cf("decisions/0012-x.md"),
@@ -712,7 +798,7 @@ mod tests {
         assert!(r.passed(), "{:?}", r.violations);
     }
 
-    // Fix 3: 改 cadenza-wasm-host(capabilities.rs)无声明 → fail,提示 secret + declare
+    // 改 cadenza-wasm-host(capabilities.rs)无声明 → fail,提示 secret + declare
     #[test]
     fn wasm_host_change_without_declaration_fails() {
         let r = evaluate(
@@ -728,10 +814,31 @@ mod tests {
         );
     }
 
-    // Fix 3: 改 cadenza-wasm-host + 写 `no secret semantics change` → pass
+    // Edge bypass: wasm-host implements host-secrets + host-workspace + host-log,
+    // so a lone `no secret semantics change` (omitting workspace/observability)
+    // must NOT pass — workspace-containment or log/audit-field changes could slip
+    // through otherwise. Still fail on the un-declared workspace + observability.
     #[test]
-    fn wasm_host_change_with_no_semantics_declaration_passes() {
+    fn wasm_host_secret_only_declaration_still_fails_workspace_and_obs() {
         let body = "Closes #1\n\nno secret semantics change";
+        let r = evaluate(&[cf("crates/cadenza-wasm-host/src/capabilities.rs")], body);
+        assert!(!r.passed(), "{:?}", r.violations);
+        assert!(
+            r.violations.iter().any(|m| m.contains("workspace")),
+            "expected an un-declared workspace violation: {:?}",
+            r.violations
+        );
+        assert!(
+            r.violations.iter().any(|m| m.contains("observability")),
+            "expected an un-declared observability violation: {:?}",
+            r.violations
+        );
+    }
+
+    // 改 cadenza-wasm-host + 三个 area 全声明 no-semantics → pass
+    #[test]
+    fn wasm_host_change_with_all_three_no_semantics_declarations_passes() {
+        let body = "Closes #1\n\nno secret semantics change\nno workspace semantics change\nno observability semantics change";
         let r = evaluate(&[cf("crates/cadenza-wasm-host/src/capabilities.rs")], body);
         assert!(r.passed(), "{:?}", r.violations);
     }
@@ -768,6 +875,55 @@ mod tests {
 @@ -10,1 +10,1 @@
 -Prefer locally verifiable anchors, in this order:
 +Prefer locally verifiable anchors, in this order:
+";
+        assert!(!diff_adds_deviation_row(diff));
+    }
+
+    // Edge bypass: DEVIATIONS.md ends with an HTML-comment row template
+    // (`<!-- ... | D1 | <what deviates...> | ... -->`). Adding a D-row-shaped line
+    // *inside* that comment must NOT unlock the escape hatch — a faked unlock.
+    // A multi-line comment block: `<!--` opens on one added line, the D-row on the
+    // next, `-->` closes on a third. The D-row is inside the comment → false.
+    #[test]
+    fn diff_adds_deviation_row_ignores_row_inside_comment_block() {
+        let diff = "\
+--- a/DEVIATIONS.md
++++ b/DEVIATIONS.md
+@@ -60,0 +61,3 @@
++<!--
++| D9 | a faked deviation hidden in the template comment | wit sig | P1 | Open | #1 |
++-->
+";
+        assert!(!diff_adds_deviation_row(diff));
+    }
+
+    // A real ledger row added in the visible table (outside any comment) → true,
+    // even when an unrelated comment block is also added elsewhere in the diff.
+    #[test]
+    fn diff_adds_deviation_row_detects_row_outside_comment() {
+        let diff = "\
+--- a/DEVIATIONS.md
++++ b/DEVIATIONS.md
+@@ -54,1 +54,4 @@
+ | _none yet_ | | | | | |
++| D9 | a genuine new deviation in the visible table | wit sig | P1 | Open | #99 |
++<!--
++| D10 | template-only example, must not count | x | P1 | Open | #1 |
++-->
+";
+        assert!(diff_adds_deviation_row(diff));
+    }
+
+    // A self-contained one-line comment (`<!-- ... -->` on a single added line)
+    // toggles in_comment twice (net no change). A D-row buried in such a one-liner
+    // is inside the comment for its whole span → must not count.
+    #[test]
+    fn diff_adds_deviation_row_ignores_row_in_single_line_comment() {
+        let diff = "\
+--- a/DEVIATIONS.md
++++ b/DEVIATIONS.md
+@@ -60,0 +61,1 @@
++<!-- | D9 | inline-comment fake | x | P1 | Open | #1 | -->
 ";
         assert!(!diff_adds_deviation_row(diff));
     }
@@ -821,14 +977,15 @@ Closes #
     }
 
     // 回归(#96):门禁要能放过它自己的无-issue 治理 PR。
-    // #96 改了 pr_gate.rs + pr-metadata.yml(GateSelf 硬路径),body 无 Closes,
-    // 并带 decisions/0011-*.md(ADR)。GateSelf 硬路径只要求 ADR(无 PR box),
-    // 0-closes 在 at-most-one 规则下合法 → 整体 pass。
+    // #96 改了 pr_gate.rs + pr-metadata.yml + main.rs(GateSelf 硬路径,Fix 1 把
+    // main.rs 也纳入),body 无 Closes,并带 decisions/0011-*.md(ADR)。GateSelf
+    // 硬路径只要求 ADR(无 PR box),0-closes 在 at-most-one 规则下合法 → 整体 pass。
     #[test]
     fn gate_passes_on_its_own_issueless_pr() {
         let changed = [
             cf(".github/workflows/pr-metadata.yml"),
             cf("crates/cadenza-cli/src/pr_gate.rs"),
+            cf("crates/cadenza-cli/src/main.rs"),
             ChangedFile {
                 path: "decisions/0011-author-time-pr-gate.md".to_string(),
                 status: ChangeStatus::Added,
@@ -838,6 +995,143 @@ Closes #
         ];
         let r = evaluate(&changed, "n/a feat branch, depends on #94");
         assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // Fix 1: main.rs is the only caller of `pr_gate::run` (its `Command::PrGate`
+    // arm); neutering it would silently skip the gate. So editing main.rs is a
+    // GateSelf hard path → needs an ADR. Without one → fail.
+    #[test]
+    fn editing_cli_main_without_adr_fails() {
+        let r = evaluate(&[cf("crates/cadenza-cli/src/main.rs")], "Closes #1");
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("PR gate") && m.contains("ADR")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // Fix 1: editing main.rs *with* an ADR → pass (GateSelf has no PR box).
+    #[test]
+    fn editing_cli_main_with_adr_passes() {
+        let changed = [
+            cf("crates/cadenza-cli/src/main.rs"),
+            cf("decisions/0011-x.md"),
+        ];
+        let r = evaluate(&changed, "Closes #1");
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // Fix 2: cadenza-codex/src/launcher.rs owns secret collection + stderr
+    // redaction; changing it with no declaration → fail (secret + declare).
+    #[test]
+    fn codex_launcher_change_without_declaration_fails() {
+        let r = evaluate(&[cf("crates/cadenza-codex/src/launcher.rs")], "Closes #1");
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("secret") && m.contains("declare")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // Fix 2: the rest of cadenza-codex (the protocol crate) is NOT a secret gate —
+    // only launcher.rs is scoped in, to avoid over-reach.
+    #[test]
+    fn codex_non_launcher_change_is_not_gated() {
+        let r = evaluate(&[cf("crates/cadenza-codex/src/lib.rs")], "Closes #1");
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // Fix 5: box detection is scoped to the `## Contract impact` section. The
+    // Reviewer checklist has a look-alike line ("Pinned dependency versions ...
+    // were not edited inline by the tool"); checking *it* must NOT satisfy the
+    // Contract-impact Pinned box. With a real pinned-version change + that box
+    // still unchecked in the Contract-impact section → fail (box unchecked).
+    #[test]
+    fn reviewer_checklist_lookalike_does_not_satisfy_contract_box() {
+        let body = "\
+## Linked issue
+Closes #1
+
+## Contract impact
+- [ ] Pinned dependency versions in `tools/versions.toml`
+
+## Reviewer checklist
+- [x] Pinned dependency versions in `tools/versions.toml` were not edited inline by the tool
+";
+        let changed = [
+            ChangedFile {
+                path: "tools/versions.toml".into(),
+                status: ChangeStatus::Modified,
+                changed_version_keys: vec!["toolchain_version".into()],
+                added_deviation_row: false,
+            },
+            cf("decisions/0011-x.md"),
+        ];
+        let r = evaluate(&changed, body);
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("pinned versions") && m.contains("unchecked")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // Fix 5: checking the Pinned box *inside* the Contract-impact section (with an
+    // ADR) satisfies the box rule, even when other sections have look-alikes.
+    #[test]
+    fn contract_impact_box_checked_satisfies_pinned() {
+        let body = "\
+## Contract impact
+- [x] Pinned dependency versions in `tools/versions.toml`
+
+## Reviewer checklist
+- [ ] Pinned dependency versions in `tools/versions.toml` were not edited inline by the tool
+";
+        let changed = [
+            ChangedFile {
+                path: "tools/versions.toml".into(),
+                status: ChangeStatus::Modified,
+                changed_version_keys: vec!["toolchain_version".into()],
+                added_deviation_row: false,
+            },
+            cf("decisions/0011-x.md"),
+        ];
+        let r = evaluate(&changed, body);
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // Fix 5: contract_impact_section slices from the heading to the next `## `.
+    #[test]
+    fn contract_impact_section_is_bounded_by_next_heading() {
+        let body = "\
+## Contract impact
+- [x] WIT ABI
+## Other
+- [x] Pinned dependency versions in `tools/versions.toml`
+";
+        let section = contract_impact_section(body);
+        assert!(section.contains("WIT ABI"), "{section:?}");
+        assert!(!section.contains("Pinned"), "{section:?}");
+    }
+
+    // Fix 5: a body with no Contract-impact section yields an empty slice (no box
+    // can be satisfied), so a hard-path change without the box still fails.
+    #[test]
+    fn no_contract_impact_section_means_no_box() {
+        assert_eq!(contract_impact_section("just prose\n## Notes\nmore"), "");
+        let r = evaluate(&[cf("wit/runtime.wit")], "no contract impact heading here");
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("WIT ABI") && m.contains("unchecked")),
+            "{:?}",
+            r.violations
+        );
     }
 
     // git mv 一个已有文件进敏感目录也算命中(分类只看路径,改名后的新路径命中)
