@@ -44,14 +44,32 @@ fn assigned_value<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// How a file changed relative to the base. Renames map to `Modified` against
+/// the destination path (we classify on the new path, treating a rename as an
+/// edit of where it landed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeStatus {
+    Added,
+    Modified,
+    Deleted,
+}
+
 /// A file changed in the PR, with just enough info to classify contract impact.
 #[derive(Debug, Clone)]
 pub struct ChangedFile {
     pub path: String,
+    /// Add / modify / delete relative to base. A deleted ADR must not satisfy the
+    /// "ADR present" requirement, so `has_adr` filters on this.
+    pub status: ChangeStatus,
     /// `tools/versions.toml` only: MVP-critical keys whose assigned value changed
     /// between base and head. Empty for every other file (and for versions.toml
     /// edits that only touched comments/formatting).
     pub changed_version_keys: Vec<String>,
+    /// `DEVIATIONS.md` only: true iff this PR's diff *adds* a real deviation table
+    /// row (a `| D<n> |` line), not just a whitespace/comment edit. The
+    /// accepted-deviation escape hatch requires a genuinely new row, so a no-op
+    /// ledger touch can't unlock the hard gate.
+    pub added_deviation_row: bool,
 }
 
 /// Result of a gate run. Empty `violations` == pass.
@@ -175,6 +193,13 @@ fn classify(changed: &[ChangedFile]) -> Vec<Area> {
         if p.starts_with("crates/cadenza-host-linear-http/") {
             push(Area::Secret);
         }
+        // cadenza-wasm-host wires the host-log / host-workspace / host-secrets
+        // capabilities (capabilities.rs); changes there can alter guest-visible
+        // logging/redaction/workspace/secret behaviour. Its most sensitive surface
+        // is host-secrets, so it falls under the Secret soft gate.
+        if p.starts_with("crates/cadenza-wasm-host/") {
+            push(Area::Secret);
+        }
     }
     areas
 }
@@ -190,6 +215,25 @@ fn box_checked(body: &str, marker: &str) -> bool {
 /// True if `path` is an ADR under `decisions/`.
 fn is_adr(path: &str) -> bool {
     path.starts_with("decisions/") && path.ends_with(".md")
+}
+
+/// True if `line` (a `DEVIATIONS.md` content line) is a real ledger row: a Markdown
+/// table row whose first cell is a `D<digits>` id, e.g. `| D7 | ... |`. Used by the
+/// IO driver to decide `added_deviation_row` from the added (`+`) lines of the diff.
+/// The header (`| ID |`) and placeholder (`| _none yet_ |`) rows are not matched.
+fn is_deviation_row(line: &str) -> bool {
+    let t = line.trim();
+    // shape: "| D<digits> |"
+    let Some(rest) = t.strip_prefix("| D") else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    // at least one digit must follow "| D"
+    if !chars.next().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // and the row must have a second cell separator somewhere after
+    t.contains("| D") && rest.contains('|')
 }
 
 /// True if `body` carries the `no <token> semantics change` declaration.
@@ -237,11 +281,18 @@ pub fn evaluate(changed: &[ChangedFile], pr_body: &str) -> GateResult {
     }
 
     let areas = classify(changed);
-    let has_adr = changed.iter().any(|f| is_adr(&f.path));
-    let touches_ledger = changed.iter().any(|f| f.path == "DEVIATIONS.md");
-    // Accepted-deviation escape hatch (Rule 5): a DEVIATIONS.md row + an ADR is a
-    // compliant way to land a contract-touching change without claiming "no impact".
-    let accepted_deviation = touches_ledger && has_adr;
+    // A *deleted* ADR doesn't satisfy "ADR present" — otherwise removing the ADR
+    // that justified a contract change would itself look compliant.
+    let has_adr = changed
+        .iter()
+        .any(|f| is_adr(&f.path) && f.status != ChangeStatus::Deleted);
+    // Accepted-deviation escape hatch (Rule 5): the PR must *add* a real
+    // `DEVIATIONS.md` row (not just touch the file) AND carry an ADR. A whitespace
+    // edit of the ledger no longer unlocks the hard gate.
+    let adds_deviation_row = changed
+        .iter()
+        .any(|f| f.path == "DEVIATIONS.md" && f.added_deviation_row);
+    let accepted_deviation = adds_deviation_row && has_adr;
 
     for area in &areas {
         if area.is_hard() {
@@ -262,10 +313,23 @@ pub fn evaluate(changed: &[ChangedFile], pr_body: &str) -> GateResult {
                 ));
             }
         } else {
-            let declared = box_checked(pr_body, area.box_marker())
-                || declares_no_change(pr_body, area.declaration_token())
-                || accepted_deviation;
-            if !declared {
+            // Soft (behaviour-crate) paths. Three compliant outcomes:
+            //   1. `no <area> semantics change` declaration → pure-internal refactor,
+            //      no ADR required (the no-ADR path).
+            //   2. box checked (author *claims* contract impact) → an ADR is then
+            //      required, mirroring CONTRIBUTING_AI.md's "contract change ⇒ ADR".
+            //   3. accepted-deviation escape hatch (new DEVIATIONS row + ADR).
+            // Anything else is a violation.
+            if declares_no_change(pr_body, area.declaration_token()) || accepted_deviation {
+                // compliant, no ADR needed
+            } else if box_checked(pr_body, area.box_marker()) {
+                if !has_adr {
+                    violations.push(format!(
+                        "declared {} impact (checked the box) but no ADR under decisions/ is included",
+                        area.label()
+                    ));
+                }
+            } else {
                 violations.push(format!(
                     "touched {} — declare contract impact (check the box) or add `no {} semantics change`",
                     area.label(),
@@ -276,6 +340,118 @@ pub fn evaluate(changed: &[ChangedFile], pr_body: &str) -> GateResult {
     }
 
     GateResult { violations }
+}
+
+/// IO driver: read the PR body from the GitHub event, diff against `base`, build
+/// the `ChangedFile` set, and run the pure `evaluate`. Lives here (not in
+/// `main.rs`) so the GateSelf hard path (`crates/cadenza-cli/src/pr_gate*`)
+/// covers the gate's *driver* as well as its pure logic. Exits non-zero on
+/// violation; fails closed if the event or diff can't be produced.
+pub fn run(base: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::fs;
+    use std::process::Command as Proc;
+
+    // PR body from the GitHub event payload. Fail-closed if unreadable.
+    let event_path = std::env::var("GITHUB_EVENT_PATH")
+        .context("GITHUB_EVENT_PATH not set (gate must run in GitHub Actions)")?;
+    let event: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&event_path).with_context(|| format!("read {event_path}"))?,
+    )?;
+    let pr_body = event
+        .pointer("/pull_request/body")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Changed files vs base, with status. Fail-closed if the diff can't be produced.
+    let out = Proc::new("git")
+        .args(["diff", "--name-status", &format!("{base}...HEAD")])
+        .output()
+        .context("running git diff")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git diff against {base} failed (need fetch-depth: 0). Refusing to pass (fail-closed)."
+        );
+    }
+
+    let changed: Vec<ChangedFile> = String::from_utf8(out.stdout)?
+        .lines()
+        .filter_map(parse_name_status_line)
+        .map(|(status, path)| {
+            let changed_version_keys = if path == "tools/versions.toml" {
+                let base_toml = Proc::new("git")
+                    .args(["show", &format!("{base}:tools/versions.toml")])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default();
+                let head_toml = fs::read_to_string("tools/versions.toml").unwrap_or_default();
+                changed_version_keys(&base_toml, &head_toml)
+            } else {
+                Vec::new()
+            };
+            let added_deviation_row = if path == "DEVIATIONS.md" {
+                Proc::new("git")
+                    .args(["diff", &format!("{base}...HEAD"), "--", "DEVIATIONS.md"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .map(|diff| diff_adds_deviation_row(&diff))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            ChangedFile {
+                path,
+                status,
+                changed_version_keys,
+                added_deviation_row,
+            }
+        })
+        .collect();
+
+    let result = evaluate(&changed, pr_body);
+    if result.passed() {
+        println!("pr-gate: ok ({} files checked)", changed.len());
+        Ok(())
+    } else {
+        for v in &result.violations {
+            eprintln!("pr-gate: {v}");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Parse one `git diff --name-status` line into `(status, path)`. The status is a
+/// single letter (`A`/`M`/`D`) or a rename/copy token like `R100` followed by the
+/// old and new paths (tab-separated). Renames/copies map to `Modified` against the
+/// destination (new) path. Returns `None` for unparseable lines.
+fn parse_name_status_line(line: &str) -> Option<(ChangeStatus, String)> {
+    let mut cols = line.split('\t');
+    let code = cols.next()?;
+    let first = code.chars().next()?;
+    match first {
+        'A' => Some((ChangeStatus::Added, cols.next()?.to_string())),
+        'D' => Some((ChangeStatus::Deleted, cols.next()?.to_string())),
+        'M' | 'T' => Some((ChangeStatus::Modified, cols.next()?.to_string())),
+        // rename/copy: "R100\told\tnew" — classify on the destination path.
+        'R' | 'C' => {
+            let _old = cols.next()?;
+            Some((ChangeStatus::Modified, cols.next()?.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// True if a unified `git diff` of `DEVIATIONS.md` *adds* at least one real ledger
+/// row (an added line, `+`-prefixed but not the `+++` file header, whose content is
+/// a `| D<n> |` row).
+fn diff_adds_deviation_row(diff: &str) -> bool {
+    diff.lines().any(|l| {
+        l.starts_with('+') && !l.starts_with("+++") && is_deviation_row(l.trim_start_matches('+'))
+    })
 }
 
 #[cfg(test)]
@@ -340,7 +516,9 @@ mod tests {
     fn versions_comment_only_change_not_gated() {
         let changed = [ChangedFile {
             path: "tools/versions.toml".into(),
+            status: ChangeStatus::Modified,
             changed_version_keys: vec![],
+            added_deviation_row: false,
         }];
         let r = evaluate(&changed, "Closes #1");
         assert!(
@@ -355,7 +533,9 @@ mod tests {
     fn versions_cli_version_change_requires_codex_box() {
         let changed = [ChangedFile {
             path: "tools/versions.toml".into(),
+            status: ChangeStatus::Modified,
             changed_version_keys: vec!["cli_version".into()],
+            added_deviation_row: false,
         }];
         let r = evaluate(&changed, "Closes #1");
         assert!(
@@ -393,12 +573,12 @@ mod tests {
         assert!(r.passed(), "{:?}", r.violations);
     }
 
-    // 接受偏离逃生口:改 orchestrator(软) + DEVIATIONS.md 行 + ADR,无需勾 box → pass
+    // 接受偏离逃生口:改 orchestrator(软) + DEVIATIONS.md 新增真 D 行 + ADR,无需勾 box → pass
     #[test]
     fn accepted_deviation_via_ledger_and_adr_passes() {
         let changed = [
             cf("crates/cadenza-orchestrator/src/lib.rs"),
-            cf("DEVIATIONS.md"),
+            cf_deviation_added(),
             cf("decisions/0011-x.md"),
         ];
         let r = evaluate(&changed, "Closes #1");
@@ -454,11 +634,161 @@ mod tests {
     }
 
     // 改 workspace + 勾 box → pass(声明了影响)；注意软路径勾 box 也要按规则3配 ADR? 否：软路径不强制 ADR
+    // Fix 5: 软路径勾 box(声明有 contract 影响)但无 ADR → fail
     #[test]
-    fn soft_path_with_box_checked_passes_without_adr() {
+    fn soft_path_with_box_but_no_adr_fails() {
         let body = "Closes #1\n- [x] Workspace path safety / containment rules";
         let r = evaluate(&[cf("crates/cadenza-workspace/src/lib.rs")], body);
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("workspace") && m.contains("ADR")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // Fix 5: 软路径勾 box + ADR → pass
+    #[test]
+    fn soft_path_with_box_and_adr_passes() {
+        let body = "Closes #1\n- [x] Workspace path safety / containment rules";
+        let changed = [
+            cf("crates/cadenza-workspace/src/lib.rs"),
+            cf("decisions/0012-x.md"),
+        ];
+        let r = evaluate(&changed, body);
         assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // Fix 5: 软路径 no-semantics 声明(无 ADR)→ pass(纯内部重构是 no-ADR 路径)
+    #[test]
+    fn soft_path_no_semantics_passes_without_adr() {
+        let body = "Closes #1\n\nno workspace semantics change";
+        let r = evaluate(&[cf("crates/cadenza-workspace/src/lib.rs")], body);
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // Fix 4: hard path + 勾 box + 只删了一个 ADR(status Deleted)→ 仍 fail(缺 ADR)
+    #[test]
+    fn deleting_an_adr_does_not_satisfy_adr_requirement() {
+        let body = "Closes #1\n- [x] WIT ABI";
+        let changed = [cf("wit/runtime.wit"), cf_deleted("decisions/0011-x.md")];
+        let r = evaluate(&changed, body);
+        assert!(
+            r.violations.iter().any(|m| m.contains("ADR")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // Fix 2: hard path + box 未勾 + DEVIATIONS.md 只改空白(无新行)+ ADR → 仍 fail(box 未勾)
+    #[test]
+    fn whitespace_ledger_edit_does_not_unlock_hard_gate() {
+        let changed = [
+            cf("wit/runtime.wit"),
+            cf_deviation_whitespace(),
+            cf("decisions/0011-x.md"),
+        ];
+        let r = evaluate(&changed, "Closes #1");
+        assert!(
+            r.violations.iter().any(|m| m.contains("unchecked")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // Fix 2: hard path + box 未勾 + DEVIATIONS.md 新增真 D 行 + ADR → pass(逃生口生效)
+    #[test]
+    fn new_ledger_row_unlocks_hard_gate() {
+        let changed = [
+            cf("wit/runtime.wit"),
+            cf_deviation_added(),
+            cf("decisions/0011-x.md"),
+        ];
+        let r = evaluate(&changed, "Closes #1");
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // Fix 3: 改 cadenza-wasm-host(capabilities.rs)无声明 → fail,提示 secret + declare
+    #[test]
+    fn wasm_host_change_without_declaration_fails() {
+        let r = evaluate(
+            &[cf("crates/cadenza-wasm-host/src/capabilities.rs")],
+            "Closes #1",
+        );
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("secret") && m.contains("declare")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // Fix 3: 改 cadenza-wasm-host + 写 `no secret semantics change` → pass
+    #[test]
+    fn wasm_host_change_with_no_semantics_declaration_passes() {
+        let body = "Closes #1\n\nno secret semantics change";
+        let r = evaluate(&[cf("crates/cadenza-wasm-host/src/capabilities.rs")], body);
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // is_deviation_row: 真 D 行匹配,header/placeholder/template 注释行不匹配
+    #[test]
+    fn is_deviation_row_matches_only_real_rows() {
+        assert!(is_deviation_row("| D1 | what | ref | P0 | Open | #1 |"));
+        assert!(is_deviation_row("| D42 | x |"));
+        assert!(!is_deviation_row("| ID | Area | ... |"));
+        assert!(!is_deviation_row("| _none yet_ | | | | | |"));
+        assert!(!is_deviation_row("| Dx | not a number |"));
+        assert!(!is_deviation_row("some prose"));
+    }
+
+    // diff_adds_deviation_row: 仅当某新增行(+,非 +++)是真 D 行才 true
+    #[test]
+    fn diff_adds_deviation_row_detects_added_row() {
+        let diff = "\
+--- a/DEVIATIONS.md
++++ b/DEVIATIONS.md
+@@ -50,1 +50,2 @@
+ | _none yet_ | | | | | |
++| D1 | a real new deviation | wit sig | P1 | Open | #99 |
+";
+        assert!(diff_adds_deviation_row(diff));
+    }
+
+    #[test]
+    fn diff_adds_deviation_row_ignores_whitespace_only() {
+        let diff = "\
+--- a/DEVIATIONS.md
++++ b/DEVIATIONS.md
+@@ -10,1 +10,1 @@
+-Prefer locally verifiable anchors, in this order:
++Prefer locally verifiable anchors, in this order:
+";
+        assert!(!diff_adds_deviation_row(diff));
+    }
+
+    // parse_name_status_line: A/M/D/R 解析,rename 用目标路径当 Modified
+    #[test]
+    fn parse_name_status_line_handles_all_codes() {
+        assert_eq!(
+            parse_name_status_line("A\tnewfile.rs"),
+            Some((ChangeStatus::Added, "newfile.rs".to_string()))
+        );
+        assert_eq!(
+            parse_name_status_line("M\tedited.rs"),
+            Some((ChangeStatus::Modified, "edited.rs".to_string()))
+        );
+        assert_eq!(
+            parse_name_status_line("D\tdecisions/0011-x.md"),
+            Some((ChangeStatus::Deleted, "decisions/0011-x.md".to_string()))
+        );
+        assert_eq!(
+            parse_name_status_line("R100\told/path.rs\tnew/path.rs"),
+            Some((ChangeStatus::Modified, "new/path.rs".to_string()))
+        );
+        assert_eq!(parse_name_status_line(""), None);
     }
 
     // 反作弊:一段等同 PR 模板的空 body 不能满足门禁(否则照抄模板就过)。
@@ -509,11 +839,43 @@ Closes #
         assert!(changed_version_keys(base, head).is_empty());
     }
 
-    // 测试辅助:构造一个无版本键变化的 ChangedFile
+    // 测试辅助:构造一个无版本键变化的 ChangedFile(默认 Modified)
     fn cf(path: &str) -> ChangedFile {
         ChangedFile {
             path: path.to_string(),
+            status: ChangeStatus::Modified,
             changed_version_keys: Vec::new(),
+            added_deviation_row: false,
+        }
+    }
+
+    // 测试辅助:构造一个被删除的 ChangedFile
+    fn cf_deleted(path: &str) -> ChangedFile {
+        ChangedFile {
+            path: path.to_string(),
+            status: ChangeStatus::Deleted,
+            changed_version_keys: Vec::new(),
+            added_deviation_row: false,
+        }
+    }
+
+    // 测试辅助:构造一个新增了真 deviation 行的 DEVIATIONS.md
+    fn cf_deviation_added() -> ChangedFile {
+        ChangedFile {
+            path: "DEVIATIONS.md".to_string(),
+            status: ChangeStatus::Modified,
+            changed_version_keys: Vec::new(),
+            added_deviation_row: true,
+        }
+    }
+
+    // 测试辅助:构造一个只改空白/无新行的 DEVIATIONS.md
+    fn cf_deviation_whitespace() -> ChangedFile {
+        ChangedFile {
+            path: "DEVIATIONS.md".to_string(),
+            status: ChangeStatus::Modified,
+            changed_version_keys: Vec::new(),
+            added_deviation_row: false,
         }
     }
 }
