@@ -1,0 +1,27 @@
+name: pr-metadata
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-gate:
+    name: pr-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `git diff origin/main...HEAD` has a reachable base.
+          # Without this the gate fails closed (see cadenza pr-gate).
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Ensure base ref present
+        run: git fetch --no-tags origin "${{ github.base_ref }}"
+      - name: Run author-time PR gate
+        run: cargo run --locked -p cadenza-cli -- pr-gate --base "origin/${{ github.base_ref }}"
