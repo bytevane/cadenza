@@ -1,4 +1,4 @@
-# ADR 0010: Author-time PR gate for contract impact
+# ADR 0011: Author-time PR gate for contract impact
 
 ## Status
 
