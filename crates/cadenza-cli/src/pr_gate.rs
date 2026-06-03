@@ -148,7 +148,8 @@ fn classify(changed: &[ChangedFile]) -> Vec<Area> {
                 push(Area::PinnedVersions);
             }
         }
-        if p == ".github/workflows/pr-metadata.yml" || p.starts_with("crates/cadenza-cli/src/pr_gate")
+        if p == ".github/workflows/pr-metadata.yml"
+            || p.starts_with("crates/cadenza-cli/src/pr_gate")
         {
             push(Area::GateSelf);
         }
@@ -181,7 +182,10 @@ fn is_adr(path: &str) -> bool {
 
 /// True if `body` carries the `no <token> semantics change` declaration.
 fn declares_no_change(body: &str, token: &str) -> bool {
-    !token.is_empty() && body.to_lowercase().contains(&format!("no {token} semantics change"))
+    !token.is_empty()
+        && body
+            .to_lowercase()
+            .contains(&format!("no {token} semantics change"))
 }
 
 /// Count `Closes #<n>` closing references (case-insensitive keyword, digits).
@@ -283,10 +287,11 @@ mod tests {
     #[test]
     fn wit_change_without_box_fails() {
         let r = evaluate(&[cf("wit/runtime.wit")], "Closes #1");
-        assert!(r
-            .violations
-            .iter()
-            .any(|m| m.contains("WIT ABI") && m.contains("unchecked")));
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("WIT ABI") && m.contains("unchecked"))
+        );
     }
 
     // 改了 wit/ 且勾了 box(且配 ADR)→ 该条不再报 box 未勾
@@ -325,10 +330,11 @@ mod tests {
             changed_version_keys: vec!["cli_version".into()],
         }];
         let r = evaluate(&changed, "Closes #1");
-        assert!(r
-            .violations
-            .iter()
-            .any(|m| m.contains("Codex") && m.contains("unchecked")));
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("Codex") && m.contains("unchecked"))
+        );
     }
 
     // 嵌套子路径也算命中(防绕过)
@@ -374,7 +380,10 @@ mod tests {
     // 改 orchestrator(软)无任何声明 → fail，提示要勾 box 或写 no-semantics
     #[test]
     fn soft_path_without_declaration_fails() {
-        let r = evaluate(&[cf("crates/cadenza-orchestrator/src/state.rs")], "Closes #1");
+        let r = evaluate(
+            &[cf("crates/cadenza-orchestrator/src/state.rs")],
+            "Closes #1",
+        );
         assert!(
             r.violations
                 .iter()
