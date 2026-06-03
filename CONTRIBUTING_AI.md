@@ -101,3 +101,4 @@ add or amend an ADR under `decisions/`:
   follow up.
 - Record recurring mistakes in `docs/research/` or in a dedicated ADR
   so future prompts avoid them.
+- When you confirm a deviation from a frozen contract, log it as a row in `DEVIATIONS.md` (do not silently make the discrepancy disappear); an accepted deviation also needs an ADR under `decisions/`.
