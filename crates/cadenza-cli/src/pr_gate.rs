@@ -74,6 +74,17 @@ impl Area {
             Area::OrchestratorState => "orchestrator state machine",
         }
     }
+
+    /// Token used in the `no <token> semantics change` declaration for soft areas.
+    fn declaration_token(self) -> &'static str {
+        match self {
+            Area::Secret => "secret",
+            Area::Observability => "observability",
+            Area::WorkspaceSafety => "workspace",
+            Area::OrchestratorState => "orchestrator",
+            _ => "", // hard areas don't use declarations
+        }
+    }
 }
 
 fn starts_with_any(path: &str, prefixes: &[&str]) -> bool {
@@ -136,6 +147,11 @@ fn is_adr(path: &str) -> bool {
     path.starts_with("decisions/") && path.ends_with(".md")
 }
 
+/// True if `body` carries the `no <token> semantics change` declaration.
+fn declares_no_change(body: &str, token: &str) -> bool {
+    !token.is_empty() && body.to_lowercase().contains(&format!("no {token} semantics change"))
+}
+
 /// Count `Closes #<n>` closing references (case-insensitive keyword, digits).
 fn count_closes(body: &str) -> usize {
     let lower = body.to_lowercase();
@@ -186,6 +202,17 @@ pub fn evaluate(changed: &[ChangedFile], pr_body: &str) -> GateResult {
                 violations.push(format!(
                     "changed {} but no ADR under decisions/ is included",
                     area.label()
+                ));
+            }
+        } else {
+            let declared = box_checked(pr_body, area.box_marker())
+                || declares_no_change(pr_body, area.declaration_token())
+                || accepted_deviation;
+            if !declared {
+                violations.push(format!(
+                    "touched {} — declare contract impact (check the box) or add `no {} semantics change`",
+                    area.label(),
+                    area.declaration_token()
                 ));
             }
         }
@@ -309,6 +336,35 @@ mod tests {
             cf("decisions/0011-x.md"),
         ];
         let r = evaluate(&changed, "Closes #1");
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // 改 orchestrator(软)无任何声明 → fail，提示要勾 box 或写 no-semantics
+    #[test]
+    fn soft_path_without_declaration_fails() {
+        let r = evaluate(&[cf("crates/cadenza-orchestrator/src/state.rs")], "Closes #1");
+        assert!(
+            r.violations
+                .iter()
+                .any(|m| m.contains("orchestrator") && m.contains("declare")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // 改 orchestrator + 写 `no orchestrator semantics change` → pass
+    #[test]
+    fn soft_path_with_no_semantics_declaration_passes() {
+        let body = "Closes #1\n\nno orchestrator semantics change";
+        let r = evaluate(&[cf("crates/cadenza-orchestrator/src/state.rs")], body);
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // 改 workspace + 勾 box → pass(声明了影响)；注意软路径勾 box 也要按规则3配 ADR? 否：软路径不强制 ADR
+    #[test]
+    fn soft_path_with_box_checked_passes_without_adr() {
+        let body = "Closes #1\n- [x] Workspace path safety / containment rules";
+        let r = evaluate(&[cf("crates/cadenza-workspace/src/lib.rs")], body);
         assert!(r.passed(), "{:?}", r.violations);
     }
 
