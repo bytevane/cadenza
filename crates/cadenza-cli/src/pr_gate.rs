@@ -131,6 +131,11 @@ fn box_checked(body: &str, marker: &str) -> bool {
     })
 }
 
+/// True if `path` is an ADR under `decisions/`.
+fn is_adr(path: &str) -> bool {
+    path.starts_with("decisions/") && path.ends_with(".md")
+}
+
 /// Count `Closes #<n>` closing references (case-insensitive keyword, digits).
 fn count_closes(body: &str) -> usize {
     let lower = body.to_lowercase();
@@ -159,13 +164,27 @@ pub fn evaluate(changed: &[ChangedFile], pr_body: &str) -> GateResult {
     }
 
     let areas = classify(changed);
+    let has_adr = changed.iter().any(|f| is_adr(&f.path));
+    let touches_ledger = changed.iter().any(|f| f.path == "DEVIATIONS.md");
+    // Accepted-deviation escape hatch (Rule 5): a DEVIATIONS.md row + an ADR is a
+    // compliant way to land a contract-touching change without claiming "no impact".
+    let accepted_deviation = touches_ledger && has_adr;
 
     for area in &areas {
         if area.is_hard() {
             // GateSelf has no dedicated PR box; treat it as needing an ADR only.
-            if *area != Area::GateSelf && !box_checked(pr_body, area.box_marker()) {
+            if *area != Area::GateSelf
+                && !box_checked(pr_body, area.box_marker())
+                && !accepted_deviation
+            {
                 violations.push(format!(
                     "changed {} but the matching Contract-impact box is unchecked",
+                    area.label()
+                ));
+            }
+            if !has_adr {
+                violations.push(format!(
+                    "changed {} but no ADR under decisions/ is included",
                     area.label()
                 ));
             }
@@ -258,6 +277,39 @@ mod tests {
     fn nested_wit_path_still_classified() {
         let r = evaluate(&[cf("wit/deep/sub.wit")], "Closes #1");
         assert!(r.violations.iter().any(|m| m.contains("WIT ABI")));
+    }
+
+    // 改了 wit/ 勾了 box 但没 ADR → fail（缺 ADR）
+    #[test]
+    fn hard_path_without_adr_fails() {
+        let body = "Closes #1\n- [x] WIT ABI";
+        let r = evaluate(&[cf("wit/runtime.wit")], body);
+        assert!(
+            r.violations.iter().any(|m| m.contains("ADR")),
+            "{:?}",
+            r.violations
+        );
+    }
+
+    // 改了 wit/ 勾 box 且配 ADR → pass
+    #[test]
+    fn hard_path_with_box_and_adr_passes() {
+        let changed = [cf("wit/runtime.wit"), cf("decisions/0011-x.md")];
+        let body = "Closes #1\n- [x] WIT ABI";
+        let r = evaluate(&changed, body);
+        assert!(r.passed(), "{:?}", r.violations);
+    }
+
+    // 接受偏离逃生口:改 orchestrator(软) + DEVIATIONS.md 行 + ADR,无需勾 box → pass
+    #[test]
+    fn accepted_deviation_via_ledger_and_adr_passes() {
+        let changed = [
+            cf("crates/cadenza-orchestrator/src/lib.rs"),
+            cf("DEVIATIONS.md"),
+            cf("decisions/0011-x.md"),
+        ];
+        let r = evaluate(&changed, "Closes #1");
+        assert!(r.passed(), "{:?}", r.violations);
     }
 
     // 测试辅助:构造一个无版本键变化的 ChangedFile
